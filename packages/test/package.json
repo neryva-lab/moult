@@ -1,0 +1,65 @@
+{
+  "name": "@moult/test",
+  "version": "0.1.1",
+  "description": "Public test host utilities for proving Moult ownership and replacement behavior.",
+  "keywords": [
+    "testing",
+    "test-utils",
+    "leak-detection",
+    "plugin-runtime",
+    "lifecycle"
+  ],
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/neryva-lab/moult.git",
+    "directory": "packages/test"
+  },
+  "bugs": {
+    "url": "https://github.com/neryva-lab/moult/issues"
+  },
+  "homepage": "https://github.com/neryva-lab/moult#readme",
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    },
+    "./package.json": "./package.json"
+  },
+  "main": "./dist/index.cjs",
+  "types": "./dist/index.d.ts",
+  "sideEffects": false,
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint . && prettier --check .",
+    "test": "vitest run --config vitest.config.ts",
+    "build": "tsdown",
+    "api-extract": "api-extractor run --local"
+  },
+  "peerDependencies": {
+    "@moult/runtime": "workspace:*"
+  },
+  "devDependencies": {
+    "@microsoft/api-extractor": "^7.59.0",
+    "@moult/runtime": "workspace:*",
+    "tsdown": "^0.22.14"
+  }
+}

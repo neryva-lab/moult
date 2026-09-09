@@ -1,0 +1,47 @@
+name: Lifecycle semantics report
+description: A guarantee behaved differently than documented — the first-class report category of this project.
+labels: ['lifecycle-semantics', 'bug']
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Moult's product is its failure behavior. If an invariant from the
+        registry (INV-01…INV-15, documented in `docs/guarantees.md`)
+        did not hold, this is the most important kind of report we receive.
+  - type: dropdown
+    id: invariant
+    attributes:
+      label: Which invariant failed?
+      options:
+        - 'INV-01: activation failure disposes every acquired resource'
+        - 'INV-02: disposal runs LIFO within one scope'
+        - 'INV-03: disposal continues after a disposer fails; errors collected'
+        - 'INV-04: a scope commits at most once; aborted scopes never commit'
+        - 'INV-05: a committed generation disposes at most once (idempotent)'
+        - 'INV-06: staged capabilities/contributions invisible before commit'
+        - 'INV-07: failed replacement leaves the old generation active and usable'
+        - 'INV-08: after commit, the old generation is never restored'
+        - 'INV-09: capability access limited to declared requirements'
+        - 'INV-10: ambiguity/missing/conflict/cycle are structured errors'
+        - 'INV-11: active dependents block stop by default; cascade explicit'
+        - 'INV-12: every resource has an owner; disposed generation owns nothing'
+        - 'INV-13: runtime instances share no mutable state'
+        - 'INV-14: post-commit disposal failure is inspectable, not a rollback'
+        - 'INV-15: provider replacement with dependents is atomic or rejected'
+        - 'another guarantee from docs/notes'
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Code plus what you observed versus what the invariant promises.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Package and version
+      placeholder: '@moult/runtime 0.1.1, Node 24.4.1'
+    validations:
+      required: true

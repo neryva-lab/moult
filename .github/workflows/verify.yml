@@ -1,0 +1,206 @@
+# CI wiring: the package scripts and this workflow are the executable quality contract.
+#
+# The adapter, browser, and release-branch benchmark stages are real checks.
+name: verify
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '0 3 * * *' # nightly stress
+  workflow_dispatch:
+
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  static:
+    # Typecheck, lint + format, dead-code hygiene — one command.
+    name: static
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm verify
+
+  test:
+    # Unit suites with coverage thresholds plus the happy-dom axis, and the
+    # property suite (fixed seed for stability, one random-seed job).
+    name: ${{ matrix.suite }} / ${{ matrix.os }} / node ${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        node: ['22', '24']
+        suite: [unit, property]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: unit suite with coverage thresholds
+        if: matrix.suite == 'unit'
+        run: pnpm test:coverage
+      - name: unit suite under happy-dom
+        if: matrix.suite == 'unit'
+        run: pnpm test:dom
+      - name: property suite, fixed seed
+        if: matrix.suite == 'property'
+        run: pnpm test:property
+        env:
+          FC_SEED: '20260831'
+      - name: property suite, random seed
+        if: matrix.suite == 'property' && matrix.os == 'ubuntu-latest' && matrix.node == '24'
+        run: pnpm test:property
+
+  stress:
+    # Stress suite — nightly and manual, not per-PR.
+    name: stress (nightly)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test:stress
+
+  package:
+    # Purity, packaging lint, tarball install + Bun smoke.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: architecture rules
+        run: pnpm check:arch
+      - name: build (dual ESM/CJS)
+        run: pnpm build
+      - name: packaging lint
+        run: pnpm check:pkg
+      - name: tarball clean install
+        run: |
+          mkdir -p /tmp/moult-pack
+          pnpm --filter @moult/runtime pack --pack-destination /tmp/moult-pack
+          smoke_dir="$(mktemp -d)"
+          cd "$smoke_dir"
+          npm init -y >/dev/null
+          npm install /tmp/moult-pack/*.tgz
+          node -e "const m = require('@moult/runtime'); if (!m) process.exit(1);"
+      - name: bun smoke
+        uses: oven-sh/setup-bun@v2
+      - name: bun smoke run
+        # Import the packed tarball from a plain npm-installed tree: the
+        # workspace link resolves through pnpm symlinks, which is not what
+        # consumers install (and `bun -e` does not resolve it reliably).
+        shell: bash
+        run: |
+          set -euo pipefail
+          smoke_dir="$(mktemp -d)"
+          cd "$smoke_dir"
+          npm init -y >/dev/null
+          npm install /tmp/moult-pack/*.tgz
+          bun -e "import('@moult/runtime').then((m) => { if (!m) process.exit(1); }).catch((e) => { console.error(e); process.exit(1); })"
+      - name: deno smoke
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - name: deno smoke run
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/moult-deno-pack
+          pnpm --filter @moult/runtime pack --pack-destination /tmp/moult-deno-pack
+          smoke_dir="$(mktemp -d)"
+          cd "$smoke_dir"
+          npm init -y >/dev/null
+          npm install /tmp/moult-deno-pack/*.tgz
+          cat > smoke.mjs <<'EOF'
+          const m = await import('@moult/runtime');
+          if (!m) throw new Error('deno smoke: empty module');
+          EOF
+          deno run --no-lock smoke.mjs
+
+  adapters:
+    # Adapter and unrelated-host replacement/leak suites.
+    name: adapters and example hosts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - run: pnpm test:adapters
+
+  browser:
+    # Real-browser replacement smoke.
+    name: browser smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - run: pnpm --filter @moult/browser-smoke exec playwright install --with-deps chromium
+      - run: pnpm test:browser
+
+  api:
+    # API review diff.
+    name: api review
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - run: pnpm check:api
+
+  demo:
+    # Benchmarks regenerate on release branches only.
+    name: bench artifact
+    if: startsWith(github.ref, 'refs/heads/release') || startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - run: pnpm bench
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: demo/comparison/

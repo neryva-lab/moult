@@ -1,0 +1,36 @@
+name: Bug report
+description: Something behaves differently than documented, or is broken.
+labels: ['bug']
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for a precise report. If the problem is that a **guarantee**
+        (INV-01…INV-15) did not hold, use the "Lifecycle semantics" template
+        instead — that category is first-class in this project.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Include a minimal reproduction — code, expected, actual.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Package and version
+      placeholder: '@moult/runtime 0.1.1, Node 24.4.1'
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - runtime-core (lifecycle / replacement / disposal)
+        - runtime-core (capability resolution / diagnostics)
+        - an adapter (events / react / vite)
+        - packaging / installation
+        - documentation
+    validations:
+      required: true

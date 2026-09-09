@@ -1,0 +1,5 @@
+{
+  // Shared base for all published packages. Adds nothing yet; exists so that
+  // package-level hardening lands in exactly one file.
+  "extends": "./tsconfig.base.json"
+}

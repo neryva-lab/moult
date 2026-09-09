@@ -1,0 +1,10 @@
+{
+  "extends": "../../tsconfig.tests.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "rootDir": ".",
+    "jsx": "react-jsx",
+    "lib": ["ES2022", "DOM"]
+  },
+  "include": ["src", "test", "tsdown.config.ts", "vitest.config.ts"]
+}

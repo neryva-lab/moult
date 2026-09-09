@@ -1,0 +1,26 @@
+{
+  "$schema": "https://typedoc.org/schema.json",
+  "name": "Moult",
+  "entryPoints": [
+    "packages/runtime-core/src/index.ts",
+    "packages/test/src/index.ts",
+    "packages/events/src/index.ts",
+    "packages/react/src/index.ts",
+    "packages/vite/src/index.ts"
+  ],
+  "readme": "README.md",
+  "tsconfig": "tsconfig.typedoc.json",
+  "out": "docs/api",
+  "excludePrivate": true,
+  "excludeInternal": true,
+  "externalSymbolLinkMappings": {
+    "@types/react": {
+      "React.Component.setState": "https://react.dev/reference/react/Component#setState",
+      "React.Component.render": "https://react.dev/reference/react/Component#render",
+      "React.ComponentLifecycle.componentDidMount": "https://react.dev/reference/react/Component#componentDidMount",
+      "React.NewLifecycle.getSnapshotBeforeUpdate": "https://react.dev/reference/react/Component#getSnapshotBeforeUpdate",
+      "React.StaticLifecycle.getDerivedStateFromProps": "https://react.dev/reference/react/Component#getDerivedStateFromProps"
+    }
+  },
+  "treatWarningsAsErrors": true
+}

@@ -1,0 +1,28 @@
+{
+  "results": [
+    {
+      "runner": "naive-registry",
+      "version": "local baseline",
+      "oldGenerationServedAfterFailure": false,
+      "leakedResourcesAfterCleanup": 102,
+      "blockedDiagnostic": "not available: no dependency graph",
+      "averageMilliseconds": 0.14219
+    },
+    {
+      "runner": "cordis",
+      "version": "4.0.0-rc.9",
+      "oldGenerationServedAfterFailure": false,
+      "leakedResourcesAfterCleanup": 0,
+      "blockedDiagnostic": "not available: dependency policy is host-defined",
+      "averageMilliseconds": 83.16917777777778
+    },
+    {
+      "runner": "@moult/runtime",
+      "version": "0.1.1",
+      "oldGenerationServedAfterFailure": true,
+      "leakedResourcesAfterCleanup": 0,
+      "blockedDiagnostic": "ACTIVE_DEPENDENTS:demo.consumer>demo.plugin",
+      "averageMilliseconds": 16.03077
+    }
+  ]
+}

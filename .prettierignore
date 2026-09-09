@@ -1,0 +1,8 @@
+pnpm-lock.yaml
+**/dist/
+**/coverage/
+**/etc/api-temp/
+**/temp/
+**/.stryker-tmp/
+**/reports/
+node_modules/
