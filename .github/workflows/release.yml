@@ -49,7 +49,7 @@ jobs:
         run: pnpm check:arch && pnpm check:pkg && pnpm check:api
       - name: regenerate benchmark evidence
         run: pnpm bench
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-benchmark-evidence
           path: demo/comparison/
