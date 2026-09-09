@@ -30,7 +30,6 @@
     "check:api": "pnpm -r api-extract",
     "bench": "pnpm --filter ./demo/comparison bench",
     "changeset": "changeset",
-    "changeset:version": "node scripts/changeset-version.mjs",
     "knip:verify": "node scripts/run-knip.mjs",
     "release:dry-run": "node scripts/release-dry-run.mjs",
     "docs:build": "typedoc",

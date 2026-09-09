@@ -15,7 +15,31 @@ concurrency:
   group: release-main
   cancel-in-progress: false
 
+# Reset default token permissions; every job declares exactly what it needs.
+permissions: {}
+
 jobs:
+  select-mode:
+    name: select changesets mode
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      mode: ${{ steps.select-mode.outputs.mode }}
+      publish-plan-artifact-id: ${{ steps.select-mode.outputs.publish-plan-artifact-id }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - id: select-mode
+        name: select version, publish, or no-op mode
+        uses: changesets/action/select-mode@v2
+
   validate:
     name: release checks
     runs-on: ubuntu-latest
@@ -91,8 +115,12 @@ jobs:
 
   version:
     name: version pull request
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: validate
+    # Only run when changesets actually require versioning. Without this gate
+    # the action attempts to open a version PR on every push — including pushes
+    # with no unreleased changesets — which fails with "GitHub Actions is not
+    # permitted to create or approve pull requests".
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.select-mode.outputs.mode == 'version'
+    needs: [validate, select-mode]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -106,10 +134,9 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - name: create or update version pull request
-        uses: changesets/action/version@8488615a623b1b9c987934bb89eae8af6a946ac1
+        uses: changesets/action/version@v2
         with:
           github-token: ${{ github.token }}
-          script: pnpm changeset:version
           commit-message: 'chore: version packages'
           pr-title: 'chore: version packages'
 
@@ -174,8 +201,12 @@ jobs:
 
   publish:
     name: publish packages
-    needs: [validate, version, release-state]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.release-state.outputs.ready == 'true'
+    # NOTE: `version` is intentionally not in `needs` — it is skipped whenever
+    # there is nothing to version, and a skipped needed job would skip publish
+    # too. `select-mode == 'publish'` plus the version-commit check in
+    # `release-state` together prove there is something to publish.
+    needs: [validate, select-mode, release-state]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.select-mode.outputs.mode == 'publish' && needs.release-state.outputs.ready == 'true'
     runs-on: ubuntu-latest
     environment: npm-release
     permissions:
@@ -194,7 +225,7 @@ jobs:
           package-manager-cache: false
       - run: pnpm install --frozen-lockfile
       - name: publish with npm trusted publishing
-        uses: changesets/action/publish@8488615a623b1b9c987934bb89eae8af6a946ac1
+        uses: changesets/action/publish@v2
         with:
           github-token: ${{ github.token }}
           script: pnpm changeset publish
