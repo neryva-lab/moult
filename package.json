@@ -18,7 +18,7 @@
   },
   "packageManager": "pnpm@11.24.0",
   "scripts": {
-    "verify": "pnpm build && pnpm -r typecheck && pnpm -r lint && pnpm knip",
+    "verify": "pnpm build && pnpm -r typecheck && pnpm -r lint && pnpm knip:verify",
     "build": "pnpm -r build",
     "test": "vitest run --project unit --project unit-dom",
     "test:property": "vitest run --project property",
@@ -30,6 +30,8 @@
     "check:api": "pnpm -r api-extract",
     "bench": "pnpm --filter ./demo/comparison bench",
     "changeset": "changeset",
+    "changeset:version": "node scripts/changeset-version.mjs",
+    "knip:verify": "node scripts/run-knip.mjs",
     "release:dry-run": "node scripts/release-dry-run.mjs",
     "docs:build": "typedoc",
     "test:coverage": "vitest run --project unit --coverage",

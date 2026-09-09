@@ -109,7 +109,7 @@ jobs:
         uses: changesets/action/version@8488615a623b1b9c987934bb89eae8af6a946ac1
         with:
           github-token: ${{ github.token }}
-          script: node scripts/changeset-version.mjs
+          script: pnpm changeset:version
           commit-message: 'chore: version packages'
           pr-title: 'chore: version packages'
 

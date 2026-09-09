@@ -11,7 +11,10 @@ if (!hasPendingChangesets) {
 }
 
 const pnpmCommand = process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm';
-const result = spawnSync(pnpmCommand, ['changeset', 'version'], { stdio: 'inherit' });
+const result = spawnSync(pnpmCommand, ['changeset', 'version'], {
+  shell: process.platform === 'win32',
+  stdio: 'inherit',
+});
 
 if (result.error) {
   console.error(result.error);
