@@ -1,0 +1,56 @@
+{
+  "name": "moult-monorepo",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Moult — a general plugin runtime for safe replacement. Root workspace: tooling and scripts only; published code lives in packages/.",
+  "license": "MIT",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/neryva-lab/moult.git"
+  },
+  "bugs": {
+    "url": "https://github.com/neryva-lab/moult/issues"
+  },
+  "homepage": "https://github.com/neryva-lab/moult#readme",
+  "engines": {
+    "node": ">=22"
+  },
+  "packageManager": "pnpm@11.24.0",
+  "scripts": {
+    "verify": "pnpm build && pnpm -r typecheck && pnpm -r lint && pnpm knip:verify",
+    "build": "pnpm -r build",
+    "test": "vitest run --project unit --project unit-dom",
+    "test:property": "vitest run --project property",
+    "test:stress": "vitest run --project stress",
+    "test:adapters": "pnpm --filter @moult/test test && pnpm --filter @moult/events test && pnpm --filter @moult/react test && pnpm --filter @moult/vite test && pnpm --filter @moult/example-command-host test && pnpm --filter @moult/example-worker-host test && pnpm --filter @moult/example-integration-demo test",
+    "test:browser": "pnpm --filter @moult/browser-smoke test",
+    "check:pkg": "pnpm --filter @moult/runtime --filter @moult/test --filter @moult/events --filter @moult/react --filter @moult/vite exec publint && pnpm --filter @moult/runtime --filter @moult/test --filter @moult/events --filter @moult/react --filter @moult/vite exec attw --pack .",
+    "check:arch": "depcruise packages --config .cruiser.json",
+    "check:api": "pnpm -r api-extract",
+    "bench": "pnpm --filter ./demo/comparison bench",
+    "changeset": "changeset",
+    "knip:verify": "node scripts/run-knip.mjs",
+    "release:dry-run": "node scripts/release-dry-run.mjs",
+    "docs:build": "typedoc",
+    "test:coverage": "vitest run --project unit --coverage",
+    "test:dom": "vitest run --project unit-dom"
+  },
+  "devDependencies": {
+    "@arethetypeswrong/cli": "^0.18.5",
+    "@changesets/cli": "3.0.1",
+    "@types/node": "^24.13.3",
+    "@vitest/coverage-v8": "^4.1.11",
+    "dependency-cruiser": "^18.2.0",
+    "eslint": "^10.9.1",
+    "eslint-plugin-simple-import-sort": "^14.0.0",
+    "happy-dom": "^20.12.0",
+    "knip": "^6.33.0",
+    "prettier": "^3.9.6",
+    "publint": "^0.3.24",
+    "typedoc": "^0.28.20",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.68.0",
+    "vitest": "^4.1.11"
+  }
+}

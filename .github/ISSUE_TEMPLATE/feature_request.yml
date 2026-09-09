@@ -1,0 +1,27 @@
+name: Feature request
+description: Propose a capability. It must be traceable to a problem the charter states.
+labels: ['enhancement']
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem it solves
+      description: |
+        Every Moult package states the problem it solves, and a package that
+        cannot state its problem is not published. Features are held to the
+        same rule: describe the problem concretely, not the desired API.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Why existing options are insufficient
+      description: Effect Layers, TC39 `using`, Cordis, or a host-specific registry — the positioning design doc (docs/notes/08-positioning-and-related-work.md) tracks exactly this question.
+    validations:
+      required: true

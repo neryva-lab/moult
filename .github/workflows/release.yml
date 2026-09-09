@@ -1,0 +1,233 @@
+name: release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Run the release-plan and tarball publication dry run'
+        required: true
+        type: boolean
+        default: true
+
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
+# Reset default token permissions; every job declares exactly what it needs.
+permissions: {}
+
+jobs:
+  select-mode:
+    name: select changesets mode
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      mode: ${{ steps.select-mode.outputs.mode }}
+      publish-plan-artifact-id: ${{ steps.select-mode.outputs.publish-plan-artifact-id }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - id: select-mode
+        name: select version, publish, or no-op mode
+        uses: changesets/action/select-mode@v2
+
+  validate:
+    name: release checks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: static checks
+        run: pnpm verify
+      - name: unit and DOM tests
+        run: pnpm test:coverage
+      - name: happy-dom unit axis
+        run: pnpm test:dom
+      - name: property and stress tests
+        run: pnpm test:property
+        env:
+          FC_SEED: '20260831'
+      - name: random property and stress tests
+        run: pnpm test:property && pnpm test:stress
+      - name: adapter and host tests
+        run: pnpm test:adapters
+      - name: browser smoke
+        run: pnpm --filter @moult/browser-smoke exec playwright install --with-deps chromium; pnpm test:browser
+      - name: architecture, package, and API checks
+        run: pnpm check:arch && pnpm check:pkg && pnpm check:api
+      - name: regenerate benchmark evidence
+        run: pnpm bench
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-benchmark-evidence
+          path: demo/comparison/
+
+  dry-run:
+    name: changesets dry run
+    if: github.event_name == 'workflow_dispatch' && inputs.dry_run == true
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: calculate release plan
+        run: pnpm changeset status --verbose
+      - name: create ephemeral snapshot versions
+        run: pnpm changeset version --snapshot release-dry-run
+      - name: rebuild snapshot packages
+        run: pnpm build
+      - name: recheck snapshot package metadata
+        run: pnpm check:pkg
+      - name: simulate npm publication without upload
+        shell: bash
+        run: |
+          set -euo pipefail
+          pack_dir="$RUNNER_TEMP/moult-release-dry-run"
+          mkdir -p "$pack_dir"
+          for package_dir in packages/*; do
+            pnpm --dir "$package_dir" pack --pack-destination "$pack_dir"
+            pnpm --dir "$package_dir" publish --dry-run --no-git-checks --tag dry-run --access public
+          done
+          test "$(find "$pack_dir" -name '*.tgz' | wc -l)" -eq 5
+
+  version:
+    name: version pull request
+    # Only run when changesets actually require versioning. Without this gate
+    # the action attempts to open a version PR on every push — including pushes
+    # with no unreleased changesets — which fails with "GitHub Actions is not
+    # permitted to create or approve pull requests".
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.select-mode.outputs.mode == 'version'
+    needs: [validate, select-mode]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: create or update version pull request
+        uses: changesets/action/version@v2
+        with:
+          github-token: ${{ github.token }}
+          commit-message: 'chore: version packages'
+          pr-title: 'chore: version packages'
+
+  release-state:
+    name: verify versioned release commit
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      ready: ${{ steps.state.outputs.ready }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history: the state check diffs HEAD against its parent,
+          # which does not exist in a shallow checkout.
+          fetch-depth: 0
+      - id: state
+        name: require a versioned release commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+
+          const { execFileSync } = require('node:child_process');
+          const pending = fs.readdirSync('.changeset').some(
+            (entry) => entry.endsWith('.md') && entry !== 'README.md',
+          );
+          const headSubject = execFileSync('git', ['log', '-1', '--format=%s'], {
+            encoding: 'utf8',
+          }).trim();
+          const changedFiles = execFileSync('git', ['diff-tree', '--no-commit-id', '--name-only', '-r', 'HEAD'], {
+            encoding: 'utf8',
+          })
+            .trim()
+            .split('\n')
+            .filter(Boolean);
+          const versionedCommit = headSubject === 'chore: version packages';
+          const versionFilesChanged = changedFiles.some(
+            (file) => file.endsWith('/package.json') || file.endsWith('/CHANGELOG.md'),
+          );
+          const packageDirs = fs.readdirSync('packages', { withFileTypes: true })
+            .filter((entry) => entry.isDirectory())
+            .map((entry) => path.join('packages', entry.name));
+          const versions = packageDirs.map((directory) => {
+            const manifest = JSON.parse(fs.readFileSync(path.join(directory, 'package.json'), 'utf8'));
+            return { name: manifest.name, version: manifest.version };
+          });
+          const publishable = versions.filter(({ name }) => name.startsWith('@moult/'));
+          const ready =
+            versionedCommit &&
+            versionFilesChanged &&
+            !pending &&
+            publishable.length === 5 &&
+            publishable.every(({ version }) => version !== '0.0.0');
+          console.log(JSON.stringify({ headSubject, versionedCommit, versionFilesChanged, pending, publishable, ready }));
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `ready=${ready}\n`);
+          NODE
+
+  publish:
+    name: publish packages
+    # NOTE: `version` is intentionally not in `needs` — it is skipped whenever
+    # there is nothing to version, and a skipped needed job would skip publish
+    # too. `select-mode == 'publish'` plus the version-commit check in
+    # `release-state` together prove there is something to publish.
+    needs: [validate, select-mode, release-state]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.select-mode.outputs.mode == 'publish' && needs.release-state.outputs.ready == 'true'
+    runs-on: ubuntu-latest
+    environment: npm-release
+    permissions:
+      contents: write
+      id-token: write
+    env:
+      NPM_CONFIG_PROVENANCE: 'true'
+      NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org/
+          package-manager-cache: false
+      - run: pnpm install --frozen-lockfile
+      - name: publish with npm trusted publishing
+        uses: changesets/action/publish@v2
+        with:
+          github-token: ${{ github.token }}
+          script: pnpm changeset publish
+          create-github-releases: true
+          push-git-tags: true

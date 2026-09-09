@@ -1,0 +1,8 @@
+{
+  // Shared base for test projects. Node and vitest globals are
+  // ambient for tests only; src never inherits them.
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "types": ["node", "vitest/globals"]
+  }
+}

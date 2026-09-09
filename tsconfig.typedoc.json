@@ -1,0 +1,20 @@
+{
+  // Compiler options for the TypeDoc API-site build only (`pnpm docs:build`).
+  // This config is not part of any build or gate: it reuses the
+  // shared base options and adds DOM/jsx solely so the React adapter's
+  // sources can be parsed for documentation. Core and adapter builds still
+  // exclude DOM from their own configs.
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "lib": ["es2022", "esnext.disposable", "dom"],
+    "jsx": "react-jsx",
+    "noEmit": true
+  },
+  "include": [
+    "packages/runtime-core/src",
+    "packages/test/src",
+    "packages/events/src",
+    "packages/react/src",
+    "packages/vite/src"
+  ]
+}

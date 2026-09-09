@@ -1,0 +1,11 @@
+{
+  "extends": "../../tsconfig.tests.json",
+  "compilerOptions": {
+    "jsx": "react-jsx",
+    "outDir": "dist",
+    "rootDir": ".",
+    "lib": ["es2022", "dom", "dom.iterable", "esnext.disposable"],
+    "types": ["node", "vitest/globals"]
+  },
+  "include": ["src", "test", "vite.config.ts", "vitest.config.ts"]
+}

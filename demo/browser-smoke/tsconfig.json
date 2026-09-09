@@ -1,0 +1,5 @@
+{
+  "extends": "../../tsconfig.tests.json",
+  "compilerOptions": { "rootDir": ".", "outDir": "dist" },
+  "include": ["test", "playwright.config.ts"]
+}

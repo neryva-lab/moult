@@ -1,0 +1,10 @@
+# Normalize line endings: LF everywhere in the repository, on every platform.
+# Prettier (endOfLine: lf, the default) and the CI matrix assume this; without
+# it, Windows contributors generate CRLF churn in every diff.
+* text=auto eol=lf
+
+# Binary assets never get normalized.
+*.png binary
+*.ico binary
+*.woff binary
+*.woff2 binary
