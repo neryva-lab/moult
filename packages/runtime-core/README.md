@@ -53,7 +53,7 @@ const storage = capability<{ get(key: string): string | undefined }>('storage', 
 
 const runtime = createRuntime();
 runtime.install({
-  id: 'memory-storage',
+  id: 'memory.storage',
   version: '1.0.0',
   provides: [{ capability: storage }],
   setup: (context) => {
@@ -61,22 +61,22 @@ runtime.install({
     context.provide(storage, { get: (key) => map.get(key) });
   },
 });
-await runtime.start('memory-storage');
+await runtime.start('memory.storage');
 
 // A broken replacement leaves the old generation serving:
 await runtime.replace({
-  id: 'memory-storage',
+  id: 'memory.storage',
   version: '2.0.0',
   provides: [{ capability: storage }],
   setup: () => {
     throw new Error('bug in the new version');
   },
-}); // rejects — and memory-storage is still active
+}); // rejects — and memory.storage is still active
 ```
 
 ## Status
 
-Implemented; packaged but not yet released. The design notes and the full
+Implemented and published. The design notes and the full
 invariant registry (INV-01…INV-15) live in the repository
 under `docs/`. See the root README for scope, non-goals, and how Moult compares
 to Effect, TC39 `using`, and Cordis.
