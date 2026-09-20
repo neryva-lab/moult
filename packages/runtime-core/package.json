@@ -62,11 +62,11 @@
     "semver": "^7.8.5"
   },
   "devDependencies": {
-    "@microsoft/api-extractor": "^7.59.0",
+    "@microsoft/api-extractor": "^7.59.1",
     "@stryker-mutator/core": "^10.0.0",
     "@stryker-mutator/vitest-runner": "^10.0.0",
     "@types/semver": "^7.8.0",
-    "fast-check": "^4.9.0",
-    "tsdown": "^0.22.14"
+    "fast-check": "^4.10.1",
+    "tsdown": "^0.23.0"
   }
 }
