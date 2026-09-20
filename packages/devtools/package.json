@@ -1,0 +1,66 @@
+{
+  "bugs": {
+    "url": "https://github.com/neryva-lab/moult/issues"
+  },
+  "description": "Development-time diagnostics for Moult: generation timelines and leak reports.",
+  "devDependencies": {
+    "@microsoft/api-extractor": "^7.59.0",
+    "@moult/runtime": "workspace:*",
+    "@moult/test": "workspace:*",
+    "tsdown": "^0.22.14"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "exports": {
+    ".": {
+      "import": {
+        "default": "./dist/index.js",
+        "types": "./dist/index.d.ts"
+      },
+      "require": {
+        "default": "./dist/index.cjs",
+        "types": "./dist/index.d.cts"
+      }
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "homepage": "https://github.com/neryva-lab/moult#readme",
+  "keywords": [
+    "moult",
+    "plugin-runtime",
+    "devtools",
+    "diagnostics",
+    "timeline"
+  ],
+  "license": "MIT",
+  "main": "./dist/index.cjs",
+  "name": "@moult/devtools",
+  "peerDependencies": {
+    "@moult/runtime": "workspace:*"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "directory": "packages/devtools",
+    "type": "git",
+    "url": "git+https://github.com/neryva-lab/moult.git"
+  },
+  "scripts": {
+    "api-extract": "api-extractor run --local",
+    "build": "tsdown",
+    "lint": "eslint . && prettier --check .",
+    "test": "vitest run --config vitest.config.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "sideEffects": false,
+  "type": "module",
+  "types": "./dist/index.d.ts",
+  "version": "0.1.1"
+}

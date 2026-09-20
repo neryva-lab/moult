@@ -1599,12 +1599,8 @@ describe('integration-demo (real-app, robust, end-to-end)', () => {
     });
     expect(rt.getStatus('demo.vite-exhaustive')).toBe('active');
 
-    // handleRemoved with active plugin must fail (uninstall requires stopped) — bridge wraps as REPLACEMENT_FAILED
-    await expect(bridge.handleRemoved({ pluginId: 'demo.vite-exhaustive' })).rejects.toSatisfy(
-      (e: unknown) => isMoltError(e) && e.code === 'REPLACEMENT_FAILED',
-    );
-    expect(rt.getStatus('demo.vite-exhaustive')).toBe('active');
-    await rt.stop('demo.vite-exhaustive');
+    // handleRemoved stops an active plugin before uninstalling it (F12):
+    // removal succeeds and the plugin is gone.
     await bridge.handleRemoved({ pluginId: 'demo.vite-exhaustive' });
     expect(rt.getStatus('demo.vite-exhaustive')).toBeUndefined();
 

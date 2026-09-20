@@ -59,6 +59,14 @@ export interface InspectionPluginInput {
   readonly blocked?: readonly BlockedDiagnostic[] | undefined;
   /** The generation's capped diagnostic log, when one is committed. */
   readonly diagnostics?: readonly DiagnosticInput[] | undefined;
+  /** Last observed health of the committed generation. */
+  readonly health?: 'unknown' | 'healthy' | 'unhealthy' | undefined;
+  /** True while the generation is quarantined. */
+  readonly quarantined?: boolean | undefined;
+  /** True when installed lazy and never explicitly started. */
+  readonly lazy?: boolean | undefined;
+  /** The id of the plugin's pinned generation, when one is kept alive. */
+  readonly pinnedGeneration?: string | undefined;
 }
 
 export interface InspectionCapabilityInput {
@@ -101,6 +109,12 @@ export function buildInspection(input: {
           ...(plugin.diagnostics !== undefined
             ? { diagnostics: Object.freeze(plugin.diagnostics.map(snapshotDiagnostic)) }
             : {}),
+          ...(plugin.health !== undefined ? { health: plugin.health } : {}),
+          ...(plugin.quarantined !== undefined ? { quarantined: plugin.quarantined } : {}),
+          ...(plugin.lazy !== undefined ? { lazy: plugin.lazy } : {}),
+          ...(plugin.pinnedGeneration !== undefined
+            ? { pinnedGeneration: plugin.pinnedGeneration }
+            : {}),
         }),
       ),
     ),
@@ -126,6 +140,10 @@ export function formatBlockedPlugin(blocked: BlockedDiagnostic): string {
       lines.push(`   ${branch} ${name} provides ${candidate.version} (incompatible)`);
     } else if (candidate.verdict === 'stopped') {
       lines.push(`   ${branch} ${name} provides ${candidate.version} but is stopped`);
+    } else if (candidate.verdict === 'quarantined') {
+      lines.push(`   ${branch} ${name} provides ${candidate.version} but is quarantined`);
+    } else if (candidate.verdict === 'lazy') {
+      lines.push(`   ${branch} ${name} provides ${candidate.version} but was never started (lazy)`);
     } else {
       lines.push(`   ${branch} ${name} provides ${candidate.version}`);
     }

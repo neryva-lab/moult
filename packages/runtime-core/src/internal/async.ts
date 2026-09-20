@@ -29,19 +29,31 @@ export class OperationQueue {
   run<T>(key: string, operation: () => T | Promise<T>): Promise<T> {
     const settled = this.#tails.get(key) ?? Promise.resolve();
     const result = settled.then(operation);
-    this.#tails.set(
-      key,
-      result.then(
-        () => undefined,
-        () => undefined,
-      ),
+    const tail = result.then(
+      () => undefined,
+      () => undefined,
     );
+    this.#tails.set(key, tail);
+    // F11: a settled tail for a key with no newer operation is dead weight.
+    // Drop the entry when the queue drains so id churn in long-running
+    // hosts cannot grow memory unboundedly. The identity check keeps a
+    // newer queued operation's tail intact.
+    void tail.then(() => {
+      if (this.#tails.get(key) === tail) {
+        this.#tails.delete(key);
+      }
+    });
     return result;
   }
 
   /** Resolves when every operation ever queued for the key has settled. */
   async tail(key: string): Promise<void> {
     await this.#tails.get(key);
+  }
+
+  /** Number of keys with a live queued tail. Diagnostic surface only. */
+  get size(): number {
+    return this.#tails.size;
   }
 }
 
@@ -137,4 +149,40 @@ export async function withTimeout<T>(
       clearTimeout(timer);
     }
   }
+}
+
+/**
+ * Races a promise against an AbortSignal. When the signal is already
+ * aborted — or aborts while the promise is pending — the returned promise
+ * rejects with `makeError()` and the source promise's late settlement is
+ * ignored by the caller (the source itself keeps running; only the wait
+ * is abandoned). With no signal, the promise passes through untouched.
+ */
+export function abortable<T>(
+  promise: Promise<T>,
+  signal: AbortSignal | undefined,
+  makeError: () => Error,
+): Promise<T> {
+  if (signal === undefined) {
+    return promise;
+  }
+  if (signal.aborted) {
+    return Promise.reject(makeError());
+  }
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => {
+      reject(makeError());
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      },
+    );
+  });
 }

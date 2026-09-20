@@ -109,9 +109,14 @@ export function useContributions<T>(key: ContributionKey<T>): readonly T[] {
   const store = useContext(RuntimeSnapshotContext);
   if (store === undefined) throw new Error('useContributions must be used inside RuntimeProvider');
   const snapshot = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
-  const entries = snapshot.entries.get(key.id) ?? [];
-  // The contribution key is the type authority for the opaque value at this boundary.
-  return entries.map((entry) => entry.value as T);
+  const entries = snapshot.entries.get(key.id);
+  // The snapshot store only swaps the snapshot object on lifecycle events, so
+  // `entries` is referentially stable across renders while contributions are
+  // unchanged. Memoizing on it keeps the mapped array stable too, so
+  // downstream React.memo consumers are not invalidated by unrelated
+  // re-renders. The contribution key is the type authority for the opaque
+  // value at this boundary.
+  return useMemo(() => (entries ?? []).map((entry) => entry.value as T), [entries]);
 }
 
 /**
@@ -172,7 +177,91 @@ export class ContributionErrorBoundary extends Component<
 }
 
 /**
+ * Per-runtime generation liveness: which generation id is live for each
+ * plugin. Populated once from `inspect()` and kept current by lifecycle
+ * events, so guarded callbacks get O(1) liveness checks without rebuilding
+ * an O(plugins) inspect snapshot per invocation.
+ */
+interface GenerationLiveness {
+  /** Active plugin id → its live generation id. */
+  readonly byPlugin: Map<string, string>;
+  /** Live generation id → its plugin id. */
+  readonly byGeneration: Map<string, string>;
+}
+
+/**
+ * Liveness caches keyed by runtime. The value never references the runtime —
+ * the subscriber closure only touches the maps — so entries vanish when the
+ * runtime is garbage-collected; nothing here extends a runtime's lifetime.
+ */
+const generationLiveness = new WeakMap<Runtime, GenerationLiveness>();
+
+function getGenerationLiveness(runtime: Runtime): GenerationLiveness {
+  const cached = generationLiveness.get(runtime);
+  if (cached !== undefined) return cached;
+  const live: GenerationLiveness = { byPlugin: new Map(), byGeneration: new Map() };
+  let unsubscribe: (() => void) | undefined;
+  const onEvent: RuntimeListener = (event) => {
+    switch (event.type) {
+      case 'started':
+      case 'replaced': {
+        // Both carry the live (pluginId, generation) pair. 'replaced'
+        // supersedes the plugin's previous generation mapping.
+        if (event.pluginId === undefined || event.generation === undefined) return;
+        const previous = live.byPlugin.get(event.pluginId);
+        if (previous !== undefined && previous !== event.generation) {
+          live.byGeneration.delete(previous);
+        }
+        live.byPlugin.set(event.pluginId, event.generation);
+        live.byGeneration.set(event.generation, event.pluginId);
+        return;
+      }
+      case 'stopped': {
+        // Delete only when the event names the generation we track: a stale
+        // or superseded event must not clear a newer mapping.
+        if (event.pluginId === undefined || event.generation === undefined) return;
+        if (live.byPlugin.get(event.pluginId) === event.generation) {
+          live.byPlugin.delete(event.pluginId);
+        }
+        if (live.byGeneration.get(event.generation) === event.pluginId) {
+          live.byGeneration.delete(event.generation);
+        }
+        return;
+      }
+      case 'disposed': {
+        live.byPlugin.clear();
+        live.byGeneration.clear();
+        unsubscribe?.();
+        unsubscribe = undefined;
+        return;
+      }
+      default:
+        // 'installed' and 'failed' carry no generation; nothing to track.
+        return;
+    }
+  };
+  // Subscribe before the initial populate so no event is missed. The two
+  // steps run synchronously back-to-back, so no event can interleave between
+  // them in practice. The residual theoretical window is benign: the guard
+  // below is documented best-effort, and a stale entry can only cause a
+  // single skipped or extra guarded invocation before the next event
+  // corrects the cache.
+  unsubscribe = runtime.subscribe(onEvent);
+  for (const plugin of runtime.inspect().plugins) {
+    if (plugin.status === 'active' && plugin.generation !== undefined) {
+      live.byPlugin.set(plugin.id, plugin.generation);
+      live.byGeneration.set(plugin.generation, plugin.id);
+    }
+  }
+  generationLiveness.set(runtime, live);
+  return live;
+}
+
+/**
  * A stale generation callback becomes a no-op after replacement or disposal.
+ * Liveness is tracked per runtime via lifecycle events (best-effort: a
+ * callback racing a concurrent lifecycle transition may run or be skipped
+ * once before the event stream catches up).
  * @throws Errors thrown by the wrapped callback are forwarded to its caller.
  * @public
  */
@@ -182,11 +271,9 @@ export function guardGenerationCallback<TArgs extends readonly unknown[], TResul
   callback: (...args: TArgs) => TResult,
   onStale?: () => void,
 ): (...args: TArgs) => TResult | undefined {
+  const live = getGenerationLiveness(runtime);
   return (...args: TArgs): TResult | undefined => {
-    const current = runtime
-      .inspect()
-      .plugins.some((plugin) => plugin.status === 'active' && plugin.generation === generation);
-    if (!current) {
+    if (!live.byGeneration.has(generation)) {
       onStale?.();
       return undefined;
     }

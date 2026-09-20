@@ -3,6 +3,7 @@
 // in isolation.
 
 import {
+  abortable,
   BoundedLog,
   createDeferred,
   idempotent,
@@ -77,6 +78,32 @@ describe('OperationQueue', () => {
     await first;
     await waiting;
     expect(settled).toBe(true);
+  });
+
+  it('drops the tail entry when the queue drains (F11 — no per-id leak)', async () => {
+    const queue = new OperationQueue();
+    await queue.run('a', () => undefined);
+    await queue.run('b', () => undefined);
+    // Let the drain-cleanup microtasks run after the tails settle.
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(queue.size).toBe(0);
+  });
+
+  it('keeps the tail while a newer operation is still queued', async () => {
+    const queue = new OperationQueue();
+    const gate = createDeferred<void>();
+    const first = queue.run('a', () => gate.promise);
+    const second = queue.run('a', () => undefined);
+    await Promise.resolve();
+    // The first tail settled-replaced: only the live tail is tracked.
+    expect(queue.size).toBe(1);
+    gate.resolve();
+    await first;
+    await second;
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(queue.size).toBe(0);
   });
 });
 
@@ -156,5 +183,42 @@ describe('BoundedLog', () => {
   it('rejects a non-positive or non-integer capacity', () => {
     expect(() => new BoundedLog<number>(0)).toThrow(RangeError);
     expect(() => new BoundedLog<number>(1.5)).toThrow(RangeError);
+  });
+});
+
+describe('abortable', () => {
+  it('passes the promise through untouched without a signal', async () => {
+    await expect(abortable(Promise.resolve(42), undefined, () => new Error('nope'))).resolves.toBe(
+      42,
+    );
+  });
+
+  it('rejects with makeError when the signal is already aborted', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const failure = new Error('aborted');
+    await expect(abortable(new Promise(() => {}), controller.signal, () => failure)).rejects.toBe(
+      failure,
+    );
+  });
+
+  it('rejects when the signal aborts mid-flight and ignores the late settlement', async () => {
+    const controller = new AbortController();
+    const failure = new Error('aborted');
+    let settled = false;
+    const pending = abortable(
+      new Promise<string>((resolve) =>
+        setTimeout(() => {
+          settled = true;
+          resolve('late');
+        }, 20),
+      ),
+      controller.signal,
+      () => failure,
+    );
+    controller.abort();
+    await expect(pending).rejects.toBe(failure);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(settled).toBe(true);
   });
 });

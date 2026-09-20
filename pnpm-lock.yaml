@@ -127,6 +127,21 @@ importers:
         specifier: workspace:*
         version: link:../../packages/test
 
+  packages/devtools:
+    devDependencies:
+      '@microsoft/api-extractor':
+        specifier: ^7.59.0
+        version: 7.59.0(@types/node@24.13.3)
+      '@moult/runtime':
+        specifier: workspace:*
+        version: link:../runtime-core
+      '@moult/test':
+        specifier: workspace:*
+        version: link:../test
+      tsdown:
+        specifier: ^0.22.14
+        version: 0.22.14(@arethetypeswrong/core@0.18.5)(oxc-resolver@11.24.2)(publint@0.3.24)(typescript@5.9.3)
+
   packages/events:
     devDependencies:
       '@microsoft/api-extractor':
@@ -202,6 +217,22 @@ importers:
       '@moult/runtime':
         specifier: workspace:*
         version: link:../runtime-core
+      tsdown:
+        specifier: ^0.22.14
+        version: 0.22.14(@arethetypeswrong/core@0.18.5)(oxc-resolver@11.24.2)(publint@0.3.24)(typescript@5.9.3)
+
+  packages/verify:
+    dependencies:
+      semver:
+        specifier: ^7.8.5
+        version: 7.8.5
+    devDependencies:
+      '@microsoft/api-extractor':
+        specifier: ^7.59.0
+        version: 7.59.0(@types/node@24.13.3)
+      '@types/semver':
+        specifier: ^7.8.0
+        version: 7.8.0
       tsdown:
         specifier: ^0.22.14
         version: 0.22.14(@arethetypeswrong/core@0.18.5)(oxc-resolver@11.24.2)(publint@0.3.24)(typescript@5.9.3)

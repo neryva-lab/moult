@@ -35,6 +35,15 @@ export type {
 export type { DisposalReport, MoltErrorInit, RuntimeErrorCode } from './errors.js';
 export type { BlockedDiagnostic } from './resolver.js';
 export type {
+  DependentInfo,
+  FailedStage,
+  GraphIssue,
+  ReplacePlan,
+  StartPlan,
+  StopPlan,
+  TransitionRecord,
+} from './runtime.js';
+export type {
   InstallOptions,
   ReplaceOptions,
   Runtime,
@@ -44,5 +53,6 @@ export type {
   StartOptions,
   StopOptions,
   TimeoutOptions,
+  UninstallOptions,
 } from './runtime.js';
 export type { Scope } from './scope.js';

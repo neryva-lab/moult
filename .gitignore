@@ -33,3 +33,4 @@ docs/api/
 # OS
 .DS_Store
 Thumbs.db
+.pnpm-store/

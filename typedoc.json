@@ -6,7 +6,8 @@
     "packages/test/src/index.ts",
     "packages/events/src/index.ts",
     "packages/react/src/index.ts",
-    "packages/vite/src/index.ts"
+    "packages/vite/src/index.ts",
+    "packages/verify/src/index.ts"
   ],
   "readme": "README.md",
   "tsconfig": "tsconfig.typedoc.json",

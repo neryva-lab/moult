@@ -22,7 +22,7 @@ import { freezeDefinition, validateDefinition } from './definition.js';
 import type { DisposalReport } from './errors.js';
 import { isMoltError, MoltError } from './errors.js';
 import { buildInspection } from './inspection.js';
-import { BoundedLog, OperationQueue, withTimeout } from './internal/async.js';
+import { abortable, BoundedLog, OperationQueue, withTimeout } from './internal/async.js';
 import { satisfiesRange } from './internal/semver.js';
 import type {
   BlockedDiagnostic,
@@ -48,6 +48,26 @@ export interface RuntimeInspection {
     readonly generation?: string;
     readonly error?: unknown;
     readonly blockedBy?: readonly BlockedDiagnostic[];
+    /**
+     * Last observed health of the committed generation: `'unknown'` until
+     * the first probe (post-commit gate or `checkHealth()`).
+     */
+    readonly health?: 'unknown' | 'healthy' | 'unhealthy';
+    /**
+     * True while the generation is quarantined: withdrawn from provider
+     * selection, scope alive, existing holders keep serving.
+     */
+    readonly quarantined?: boolean;
+    /**
+     * True when the plugin was installed lazy and has never been
+     * explicitly started.
+     */
+    readonly lazy?: boolean;
+    /**
+     * The id of the plugin's pinned generation, when one is kept alive by
+     * `inFlight: 'pin'`. At most one pin per plugin.
+     */
+    readonly pinnedGeneration?: string;
     /**
      * The generation's capped diagnostic log — what the plugin passed to
      * `ctx.diagnose`, oldest first. Present only while a committed
@@ -79,12 +99,27 @@ export interface RuntimeInspection {
  *
  * @public
  */
+/**
+ * The pipeline stage at which a `failed` event occurred:
+ * - `'resolve'`: dependency resolution found no viable plan.
+ * - `'validate'`: the definition or its claims were rejected.
+ * - `'config'`: configuration resolution or `validateConfig` failed.
+ * - `'setup'`: a `setup` hook (or the `migrate` hook inside it) failed.
+ * - `'prepare'`: candidate preparation for a rebind transaction failed.
+ * - `'health'`: the post-commit health gate rejected a candidate.
+ *
+ * @public
+ */
+export type FailedStage = 'resolve' | 'validate' | 'config' | 'setup' | 'prepare' | 'health';
+
 export type RuntimeListener = (event: {
   readonly type: 'installed' | 'started' | 'stopped' | 'replaced' | 'failed' | 'disposed';
   readonly pluginId?: string | undefined;
   readonly generation?: string | undefined;
   readonly cascade?: readonly string[] | undefined;
   readonly error?: unknown;
+  /** Present on `'failed'` events: the pipeline stage that failed. */
+  readonly stage?: FailedStage | undefined;
 }) => void;
 
 /**
@@ -116,8 +151,27 @@ export interface InstallOptions {
    * Install-time configuration overrides, merged over the definition's
    * `config` defaults and validated by `validateConfig`. A failing
    * validation rejects the install.
+   *
+   * The definition object is deep-frozen in place: after `install`
+   * returns, the caller must treat it as immutable. Mutating it later is
+   * a programming error — generations keep the frozen reference.
    */
   readonly config?: Record<string, unknown> | undefined;
+  /**
+   * Install a lazy plugin: it registers without activating, and it is
+   * excluded from automatic provider selection until it is explicitly
+   * started. A dependent that requires a capability provided only by a
+   * lazy, unstarted plugin fails resolution with `MISSING_CAPABILITY`
+   * (or skips the requirement when optional) until the lazy plugin is
+   * started — the host owns the activation trigger.
+   */
+  readonly lazy?: boolean | undefined;
+  /**
+   * Abort signal for the install. `install` is synchronous, so the signal
+   * is only an entry gate: an already-aborted signal rejects the install
+   * with `ABORTED` before any state changes.
+   */
+  readonly signal?: AbortSignal | undefined;
 }
 
 /**
@@ -132,6 +186,14 @@ export interface StartOptions {
    * this call only.
    */
   readonly timeoutMs?: number | undefined;
+  /**
+   * Abort signal for the activation. An already-aborted signal is an entry
+   * gate: the call throws `ABORTED` synchronously before any state
+   * changes. Aborting mid-flight rejects the operation with `ABORTED` and
+   * rolls back the in-flight activation like a setup failure; phases that
+   * already committed run to completion.
+   */
+  readonly signal?: AbortSignal | undefined;
 }
 
 /**
@@ -147,6 +209,32 @@ export interface StopOptions {
    * phase of this stop. Overrides the runtime defaults for this call only.
    */
   readonly timeoutMs?: number | undefined;
+  /**
+   * Abort signal for the stop. `stop` is disposal-bounded, so the signal
+   * is an entry gate: an already-aborted signal rejects with `ABORTED`
+   * before any state changes; once disposal starts it runs to completion.
+   */
+  readonly signal?: AbortSignal | undefined;
+}
+
+/**
+ * Options for `uninstall`.
+ *
+ * @public
+ */
+export interface UninstallOptions {
+  /**
+   * Per-operation timeout override, in milliseconds: bounds the disposal
+   * phase of this uninstall (including releasing a pinned generation).
+   * Overrides the runtime defaults for this call only.
+   */
+  readonly timeoutMs?: number | undefined;
+  /**
+   * Abort signal for the uninstall. Like `stop`, the signal is an entry
+   * gate: an already-aborted signal rejects with `ABORTED` before any
+   * state changes; once disposal starts it runs to completion.
+   */
+  readonly signal?: AbortSignal | undefined;
 }
 
 /**
@@ -171,6 +259,38 @@ export interface ReplaceOptions {
    * runtime defaults for this call only.
    */
   readonly timeoutMs?: number | undefined;
+  /**
+   * Abort signal for the replacement. An already-aborted signal is an
+   * entry gate: the call throws `ABORTED` synchronously before any state
+   * changes. Aborting mid-flight rejects the operation with `ABORTED` and
+   * rolls back the in-flight transaction like a preparation failure;
+   * phases that already committed (drain, disposal of the retired
+   * generations) run to completion.
+   */
+  readonly signal?: AbortSignal | undefined;
+  /**
+   * What happens to the generations retired by this replacement:
+   * - `'drain'` (default): each retired generation's `drain` hook runs,
+   *   bounded by the drain timeout; disposal proceeds regardless of the
+   *   outcome.
+   * - `'immediate'`: the `drain` hook is skipped and retired generations
+   *   are disposed immediately.
+   * - `'pin'`: retired generations are withdrawn from provider selection
+   *   but their scopes are kept alive — no drain hook, no disposal — for
+   *   existing holders of their capability values (the transactional
+   *   rebind already guarantees no active generation still resolves to
+   *   them; only holders outside the runtime, such as host code, can
+   *   remain). The runtime cannot observe those external holders, so a
+   *   pin is a manual lifecycle: at most one pinned generation per
+   *   plugin, visible in `inspect()`; it is released (disposed, with a
+   *   `stopped` event) when the plugin is replaced again, stopped,
+   *   uninstalled, or when the runtime is disposed. A new pin supersedes
+   *   the previous one.
+   *
+   * Note: true holder refcounting would require handle-based capabilities;
+   * with direct values the host owns the release decision.
+   */
+  readonly inFlight?: 'drain' | 'immediate' | 'pin' | undefined;
 }
 
 /**
@@ -182,8 +302,21 @@ export interface ReplaceOptions {
  * @public
  */
 export interface Runtime {
+  /**
+   * Installs a plugin definition. The definition object you pass is
+   * frozen in place (`Object.freeze`, recursively over `requires`,
+   * `provides`, and `config`) — after this call, mutating it throws.
+   * Pass a fresh object per install, or spread-copy one you intend to
+   * reuse: `install({ ...def, version: '2.0.0' })`. `replace()` freezes
+   * its definition the same way.
+   */
   install(definition: PluginDefinition, options?: InstallOptions): void;
-  uninstall(id: string): Promise<void>;
+  /**
+   * Uninstalls a stopped (or never-started) plugin, releasing its pinned
+   * generation if any. Disposal is bounded by `options.timeoutMs` or the
+   * runtime's default disposal timeout.
+   */
+  uninstall(id: string, options?: UninstallOptions): Promise<void>;
   start(id: string, options?: StartOptions): Promise<void>;
   stop(id: string, options?: StopOptions): Promise<void>;
   replace(definition: PluginDefinition, options?: ReplaceOptions): Promise<void>;
@@ -206,13 +339,70 @@ export interface Runtime {
   rollback(id: string): Promise<void>;
   /**
    * Runs the active generation's `healthCheck` hook now and returns its
-   * result. A missing hook reports healthy. Unlike the post-commit gate,
-   * an unhealthy result here is only reported, never acted on.
+   * result. The result is recorded on the generation, and an unhealthy
+   * result applies the runtime's `onUnhealthy` policy: `'fail'` (default)
+   * reports only, `'quarantine'` withdraws the generation from provider
+   * selection until a healthy re-probe, and `'rollback'` rolls the plugin
+   * back to its previous definition through the normal replacement
+   * pipeline (throws `INVALID_STATE` when there is no replacement history).
+   * Unlike the post-commit gate, the probe's own result is always returned
+   * — even when the policy takes further action.
    */
   checkHealth(id: string): Promise<HealthStatus>;
   getStatus(id: string): PluginStatus | undefined;
   inspect(): RuntimeInspection;
   subscribe(listener: RuntimeListener): () => void;
+  /**
+   * Re-checks the whole active graph for consistency: every active
+   * generation's non-optional requirements must resolve to a selectable
+   * provider (optional requirements may dangle by design), every recorded
+   * provider edge must still satisfy its declared range, no
+   * single-provider capability or contribution key may be claimed twice,
+   * and no published binding may point at a dead generation. Returns the
+   * list of problems found — empty means the graph is consistent. This is
+   * a read-only diagnostic; a healthy runtime always returns `[]`.
+   */
+  validate(): readonly GraphIssue[];
+  /**
+   * Dry-runs `start(id)`: resolves the activation plan without starting
+   * anything and without emitting events. Throws the same `MoltError`
+   * `start()` would throw when the requirements cannot be satisfied.
+   * Planning the start of an already-active plugin returns an empty plan.
+   */
+  planStart(id: string): StartPlan;
+  /**
+   * Dry-runs `stop(id)`: returns the plugins that would be stopped, in
+   * stop order (dependents first). Without `cascade: true`, throws
+   * `ACTIVE_DEPENDENTS` exactly when `stop()` would.
+   */
+  planStop(id: string, options?: { readonly cascade?: boolean | undefined }): StopPlan;
+  /**
+   * Dry-runs `replace(definition)`: validates the definition and reports
+   * the active dependents that would be re-prepared and rebound. Throws
+   * the same errors `replace()` would throw before preparing candidates
+   * (invalid definition, conflicting claims, `strictDependents`
+   * rejection).
+   */
+  planReplace(
+    definition: PluginDefinition,
+    options?: { readonly strictDependents?: boolean | undefined },
+  ): ReplacePlan;
+  /**
+   * The transitive active dependents of a plugin, in provider-first
+   * (activation) order. Empty when the plugin has no active dependents
+   * or is not active.
+   */
+  inspectDependents(id: string): readonly DependentInfo[];
+  /**
+   * The bounded transition audit log, oldest first. Every lifecycle
+   * transition — installs, starts, stops, replacements, failures,
+   * quarantine and pin transitions, and final disposal — is recorded
+   * exactly once, in order, with a monotonic sequence number. The buffer
+   * holds the most recent 128 entries; older entries are evicted. The
+   * bound is fixed: the log is a diagnostic aid, not a correctness
+   * mechanism, so it is not configurable.
+   */
+  transitions(): readonly TransitionRecord[];
   contributions(): ContributionSnapshot;
   dispose(options?: { readonly timeoutMs?: number | undefined }): Promise<void>;
 }
@@ -235,6 +425,25 @@ export interface RuntimeOptions {
    * overrides these for that call only.
    */
   readonly timeouts?: TimeoutOptions | undefined;
+  /**
+   * What happens when an on-demand `checkHealth()` probe reports an
+   * unhealthy live generation:
+   * - `'fail'` (default): the status is reported and nothing else happens.
+   * - `'quarantine'`: the generation is quarantined — withdrawn from
+   *   provider selection (new `require()` calls no longer resolve to it)
+   *   while its scope stays alive and existing holders keep serving. A
+   *   later healthy probe lifts the quarantine.
+   * - `'rollback'`: the plugin is rolled back to its previous definition
+   *   through the normal replacement pipeline — including the post-commit
+   *   health gate, so a previous generation that is also unhealthy fails
+   *   the rollback with `REPLACEMENT_FAILED` and `checkHealth` rejects.
+   *   Throws `INVALID_STATE` when there is no replacement history.
+   *
+   * The post-commit health gate always fails the transaction — a candidate
+   * that fails its readiness probe never commits, regardless of this
+   * policy.
+   */
+  readonly onUnhealthy?: 'quarantine' | 'rollback' | 'fail' | undefined;
 }
 
 /**
@@ -293,7 +502,19 @@ function resolveConfig(
   // Frozen before validation: a throwing or mutating validateConfig cannot
   // corrupt the object the runtime is about to publish as ctx.config.
   const frozenMerged = Object.freeze(merged);
-  const errors = definition.validateConfig?.(frozenMerged) ?? [];
+  const rawErrors: unknown = definition.validateConfig?.(frozenMerged) ?? [];
+  // The declared return type is `readonly string[]`, but a hand-written
+  // plugin can return anything at runtime — fail loudly instead of
+  // crashing on `.join` or silently accepting garbage.
+  if (!Array.isArray(rawErrors) || rawErrors.some((entry) => typeof entry !== 'string')) {
+    throw new MoltError({
+      code,
+      message: `validateConfig for plugin ${definition.id} must return an array of strings`,
+      pluginId: definition.id,
+      details: { reason: 'invalid-validateConfig-result' },
+    });
+  }
+  const errors: readonly string[] = rawErrors;
   if (errors.length > 0) {
     throw new MoltError({
       code,
@@ -344,6 +565,40 @@ interface Generation {
   readonly config: Readonly<Record<string, unknown>>;
   /** The resolution plan this generation was built from. */
   readonly plan: ResolutionPlan;
+  /**
+   * Last observed health: 'unknown' until the first probe (post-commit
+   * gate or `checkHealth`). Mutable — updated by every probe.
+   */
+  health: 'unknown' | 'healthy' | 'unhealthy';
+  /**
+   * Quarantined generations are excluded from provider selection while
+   * their scope stays alive and existing holders keep serving. Mutable —
+   * set by the `onUnhealthy: 'quarantine'` policy and cleared by a healthy
+   * re-probe or by replacement.
+   */
+  quarantined: boolean;
+  /**
+   * Bindings and contributions stashed while quarantined; restored on
+   * unquarantine. Undefined when not quarantined.
+   */
+  quarantinedState:
+    | {
+        readonly bindings: readonly {
+          readonly tokenId: string;
+          readonly binding: PublishedBinding;
+        }[];
+        readonly contributions: readonly {
+          readonly keyId: string;
+          readonly entry: ContributionEntry;
+        }[];
+      }
+    | undefined;
+  /**
+   * True while the generation is pinned: retired by a replace with
+   * `inFlight: 'pin'`, withdrawn from provider selection, scope kept
+   * alive for existing holders. Mutable — set on pin, cleared on release.
+   */
+  pinned: boolean;
 }
 
 /**
@@ -376,6 +631,44 @@ interface PluginRecord {
    * most recent. Pushed on every successful replacement.
    */
   history: PluginDefinition[];
+  /**
+   * Installed with `lazy: true`: excluded from automatic provider
+   * selection until explicitly started.
+   */
+  lazy: boolean;
+}
+
+/**
+ * One entry in the runtime's bounded transition audit log (`transitions()`).
+ * Every lifecycle transition the runtime performs is recorded here in
+ * order: installs, starts, stops, replacements, failures, disposal, and
+ * the quarantine/pin transitions that have no subscriber event of their
+ * own. The log is a ring buffer — the oldest entries are evicted beyond
+ * the capacity bound.
+ *
+ * @public
+ */
+export interface TransitionRecord {
+  /** Monotonic sequence number: 0, 1, 2, … across the runtime's life. */
+  readonly seq: number;
+  /** `Date.now()` timestamp of the transition. */
+  readonly at: number;
+  readonly type:
+    | 'installed'
+    | 'started'
+    | 'stopped'
+    | 'replaced'
+    | 'failed'
+    | 'disposed'
+    | 'pinned'
+    | 'quarantined'
+    | 'unquarantined';
+  readonly pluginId?: string | undefined;
+  readonly generation?: string | undefined;
+  /** Present on `'failed'` transitions. */
+  readonly error?: unknown;
+  /** Present on `'failed'` transitions: the pipeline stage that failed. */
+  readonly stage?: FailedStage | undefined;
 }
 
 interface RuntimeEvent {
@@ -384,6 +677,93 @@ interface RuntimeEvent {
   readonly generation?: string | undefined;
   readonly cascade?: readonly string[] | undefined;
   readonly error?: unknown;
+  readonly stage?: FailedStage | undefined;
+}
+
+/** Maximum number of entries retained in the transition audit log. */
+const TRANSITION_CAPACITY = 128;
+
+/**
+ * The dry-run activation plan for `planStart()`: the order plugins would
+ * activate in (providers first) and the provider selected for each
+ * requirement. Nothing is started; on unresolvable requirements the call
+ * throws the same `MoltError` `start()` would throw.
+ *
+ * @public
+ */
+export interface StartPlan {
+  readonly order: readonly string[];
+  readonly selections: readonly {
+    readonly consumer: string;
+    readonly capabilityId: string;
+    readonly range: string;
+    readonly optional: boolean;
+    readonly providers: readonly {
+      /** Provider plugin id, or `null` for a host provider. */
+      readonly pluginId: string | null;
+      readonly version: string;
+    }[];
+  }[];
+}
+
+/**
+ * The dry-run stop plan for `planStop()`: plugin ids in the order they
+ * would be stopped (dependents first).
+ *
+ * @public
+ */
+export interface StopPlan {
+  readonly stopped: readonly string[];
+}
+
+/**
+ * The dry-run replacement plan for `planReplace()`: the plugin being
+ * replaced and the active dependents that would be re-prepared and
+ * rebound onto the new generation, in provider-first order.
+ *
+ * @public
+ */
+export interface ReplacePlan {
+  readonly replaced: string;
+  readonly rebound: readonly string[];
+}
+
+/**
+ * One entry of `inspectDependents()`: an active plugin that transitively
+ * depends on the inspected plugin.
+ *
+ * @public
+ */
+export interface DependentInfo {
+  readonly pluginId: string;
+  readonly generation: string;
+}
+
+/**
+ * One inconsistency found by `validate()`. An empty result means the
+ * active graph is consistent.
+ *
+ * Reachability: `unresolvable-requirement` is the user-facing diagnostic
+ * (quarantined or incompatible providers, unsatisfiable ranges). The
+ * other kinds are corruption detectors — the install/replace/commit
+ * paths reject those states up front (`AMBIGUOUS_PROVIDER`, staged
+ * conflict checks, atomic withdrawal), so a non-empty result there means
+ * the runtime's own bookkeeping is broken, not the plugin graph.
+ *
+ * @public
+ */
+export interface GraphIssue {
+  readonly kind:
+    | 'unresolvable-requirement'
+    | 'range-mismatch'
+    | 'duplicate-provider'
+    | 'duplicate-contribution'
+    | 'stale-binding'
+    | 'orphaned-generation';
+  readonly pluginId?: string | undefined;
+  readonly generation?: string | undefined;
+  readonly capabilityId?: string | undefined;
+  readonly message: string;
 }
 
 interface RequirementLike {
@@ -420,6 +800,13 @@ interface PrepareOptions {
   readonly effectiveConfig: Readonly<Record<string, unknown>>;
   /** Bound for the setup (and migrate) phase, in milliseconds. */
   readonly setupMs?: number | undefined;
+  /** Bound for disposing the candidate scope on failure, in milliseconds. */
+  readonly disposeMs?: number | undefined;
+  /**
+   * Caller abort signal. Aborting rejects the preparation with `ABORTED`;
+   * the candidate scope is disposed exactly like a setup failure.
+   */
+  readonly signal?: AbortSignal | undefined;
 }
 
 /** Fully-resolved per-phase timeouts for one operation. */
@@ -481,6 +868,16 @@ class RuntimeImpl implements Runtime {
   #generationCounter = 0;
   #disposed = false;
   #disposedPromise: Promise<void> | undefined;
+  readonly #onUnhealthy: 'quarantine' | 'rollback' | 'fail';
+  /**
+   * Pinned generations: plugin id → the retired generation kept alive by
+   * the most recent `inFlight: 'pin'` replace. At most one per plugin;
+   * withdrawn from provider selection, scope alive.
+   */
+  readonly #pinned = new Map<string, Generation>();
+  /** Bounded audit log of lifecycle transitions, oldest first. */
+  readonly #transitions: TransitionRecord[] = [];
+  #transitionSeq = 0;
   readonly #queue = new OperationQueue();
   /**
    * Default per-phase lifecycle timeouts from RuntimeOptions. A
@@ -529,6 +926,15 @@ class RuntimeImpl implements Runtime {
       drainMs: checkTimeoutMs(timeouts.drainMs, 'timeouts.drainMs'),
       healthMs: checkTimeoutMs(timeouts.healthMs, 'timeouts.healthMs'),
     };
+    const onUnhealthy = options?.onUnhealthy ?? 'fail';
+    if (onUnhealthy !== 'quarantine' && onUnhealthy !== 'rollback' && onUnhealthy !== 'fail') {
+      throw new MoltError({
+        code: 'INVALID_DEFINITION',
+        message: `invalid onUnhealthy policy: ${String(onUnhealthy)}`,
+        details: { reason: 'invalid-onUnhealthy' },
+      });
+    }
+    this.#onUnhealthy = onUnhealthy;
   }
 
   /**
@@ -553,6 +959,7 @@ class RuntimeImpl implements Runtime {
 
   install(definition: PluginDefinition, options?: InstallOptions): void {
     this.#assertUsable();
+    this.#assertNotAborted(options?.signal, definition.id);
     const failure = validateDefinition(definition);
     if (failure !== undefined) {
       throw failure;
@@ -601,27 +1008,35 @@ class RuntimeImpl implements Runtime {
       configOverrides: overrides,
       effectiveConfig,
       history: [],
+      lazy: options?.lazy === true,
     });
     this.#emit({ type: 'installed', pluginId: definition.id });
   }
 
-  uninstall(id: string): Promise<void> {
+  uninstall(id: string, options?: UninstallOptions): Promise<void> {
     this.#assertNotReentrant(id);
     this.#assertNotSelfOperation(id, 'uninstall');
     this.#assertNotRebindOwned(id);
-    return this.#enqueue(id, () => this.#uninstall(id));
+    this.#assertNotAborted(options?.signal, id);
+    const disposeMs = this.#resolveTimeouts(options?.timeoutMs).disposeMs;
+    return this.#enqueue(id, () => this.#uninstall(id, disposeMs));
   }
 
   start(id: string, options?: StartOptions): Promise<void> {
     this.#assertNotReentrant(id);
     this.#assertNotSelfOperation(id, 'start');
     this.#assertNotRebindOwned(id);
-    return this.#enqueue(id, () => this.#start(id, this.#resolveTimeouts(options?.timeoutMs)));
+    this.#assertNotAborted(options?.signal, id);
+    const signal = options?.signal;
+    return this.#enqueue(id, () =>
+      this.#start(id, this.#resolveTimeouts(options?.timeoutMs), signal),
+    );
   }
 
   stop(id: string, options?: StopOptions): Promise<void> {
     this.#assertNotReentrant(id);
     this.#assertNotRebindOwned(id);
+    this.#assertNotAborted(options?.signal, id);
     // A preparing plugin is stopped cooperatively: its scope signal aborts
     // now, because the queued stop below can only run after the start has
     // settled.
@@ -645,6 +1060,7 @@ class RuntimeImpl implements Runtime {
     this.#assertNotReentrant(definition.id);
     this.#assertNotSelfOperation(definition.id, 'replace');
     this.#assertNotRebindOwned(definition.id);
+    this.#assertNotAborted(options?.signal, definition.id);
     return this.#enqueue(definition.id, () =>
       this.#replace(definition, options, this.#resolveTimeouts(options?.timeoutMs), false),
     );
@@ -678,10 +1094,11 @@ class RuntimeImpl implements Runtime {
     record.effectiveConfig = effectiveConfig;
   }
 
-  rollback(id: string): Promise<void> {
-    this.#assertNotReentrant(id);
-    this.#assertNotSelfOperation(id, 'rollback');
-    this.#assertNotRebindOwned(id);
+  /**
+   * Returns the most recent pre-replacement definition for `rollback`.
+   * Throws synchronously when there is nothing to roll back to.
+   */
+  #previousDefinition(id: string): PluginDefinition {
     const record = this.#plugins.get(id);
     if (record === undefined) {
       throw new MoltError({
@@ -700,6 +1117,14 @@ class RuntimeImpl implements Runtime {
         details: { reason: 'no-rollback-history' },
       });
     }
+    return previous;
+  }
+
+  rollback(id: string): Promise<void> {
+    this.#assertNotReentrant(id);
+    this.#assertNotSelfOperation(id, 'rollback');
+    this.#assertNotRebindOwned(id);
+    const previous = this.#previousDefinition(id);
     // Rolls back through the normal replacement pipeline (dependents
     // rebind, migrate runs, the health gate applies). The history entry is
     // popped only on success — a failed rollback leaves history untouched.
@@ -731,9 +1156,10 @@ class RuntimeImpl implements Runtime {
         details: { reason: 'not-active' },
       });
     }
-    // On-demand probe: reported, never acted on. Queued so it never
+    // On-demand probe: the result is recorded on the generation and the
+    // configured onUnhealthy policy is applied. Queued so it never
     // interleaves with a lifecycle operation on the same plugin.
-    return this.#enqueue(id, () => {
+    return this.#enqueue(id, async () => {
       const context = this.#buildContext(
         generation.definition,
         generation,
@@ -741,7 +1167,26 @@ class RuntimeImpl implements Runtime {
         new Map(),
         generation.plan,
       );
-      return this.#runHealthCheck(generation, context, this.#resolveTimeouts(undefined).healthMs);
+      const status = await this.#runHealthCheck(
+        generation,
+        context,
+        this.#resolveTimeouts(undefined).healthMs,
+      );
+      generation.health = status.ok ? 'healthy' : 'unhealthy';
+      if (status.ok) {
+        // A healthy re-probe lifts a quarantine imposed by the policy.
+        if (generation.quarantined) {
+          this.#unquarantineGeneration(generation);
+        }
+        return status;
+      }
+      if (this.#onUnhealthy === 'quarantine') {
+        this.#quarantineGeneration(generation);
+      } else if (this.#onUnhealthy === 'rollback') {
+        const previous = this.#previousDefinition(id);
+        await this.#replace(previous, undefined, this.#resolveTimeouts(undefined), true);
+      }
+      return status;
     });
   }
 
@@ -750,14 +1195,21 @@ class RuntimeImpl implements Runtime {
   }
 
   inspect(): RuntimeInspection {
-    const plugins = [...this.#plugins.values()].map((record) => ({
-      id: record.definition.id,
-      status: record.status,
-      generationId: record.generation?.id,
-      error: record.error,
-      blocked: this.#blockedOf(record),
-      diagnostics: record.generation?.diagnostics.entries(),
-    }));
+    const plugins = [...this.#plugins.values()].map((record) => {
+      const pinned = this.#pinned.get(record.definition.id);
+      return {
+        id: record.definition.id,
+        status: record.status,
+        generationId: record.generation?.id,
+        error: record.error,
+        blocked: this.#blockedOf(record),
+        diagnostics: record.generation?.diagnostics.entries(),
+        health: record.generation?.health,
+        quarantined: record.generation?.quarantined,
+        lazy: record.lazy === true && record.generation === undefined,
+        pinnedGeneration: pinned?.id,
+      };
+    });
     const capabilities: { id: string; provider: string; version: string }[] = [];
     for (const host of this.#hostProviders.values()) {
       capabilities.push({
@@ -780,6 +1232,309 @@ class RuntimeImpl implements Runtime {
       capabilities,
       observerDiagnostics: this.#observerDiagnostics.entries(),
     });
+  }
+
+  transitions(): readonly TransitionRecord[] {
+    return Object.freeze([...this.#transitions]);
+  }
+
+  validate(): readonly GraphIssue[] {
+    const issues: GraphIssue[] = [];
+    const pinnedIds = new Set<string>();
+    for (const generation of this.#pinned.values()) {
+      pinnedIds.add(generation.id);
+    }
+    // Every published binding must point at a live generation: active or
+    // pinned. Anything else is a leak in withdrawal bookkeeping.
+    for (const [tokenId, byGeneration] of this.#published) {
+      for (const generationId of byGeneration.keys()) {
+        if (!this.#generations.has(generationId) && !pinnedIds.has(generationId)) {
+          const binding = byGeneration.get(generationId);
+          issues.push({
+            kind: 'stale-binding',
+            pluginId: binding?.pluginId ?? undefined,
+            generation: generationId,
+            capabilityId: tokenId,
+            message: `capability ${tokenId} is published by unknown generation ${generationId}`,
+          });
+        }
+      }
+    }
+    // Single-provider capabilities and contribution keys admit exactly one
+    // live, selectable claim each.
+    for (const [tokenId, byGeneration] of this.#published) {
+      const live = [...byGeneration.entries()].filter(([generationId, binding]) => {
+        const generation = this.#generations.get(generationId);
+        return generation !== undefined && !generation.quarantined && !binding.capability.multiple;
+      });
+      if (live.length > 1) {
+        issues.push({
+          kind: 'duplicate-provider',
+          capabilityId: tokenId,
+          message: `capability ${tokenId} is claimed by ${live.length} live generations: ${live
+            .map(([generationId]) => generationId)
+            .join(', ')}`,
+        });
+      }
+    }
+    for (const [keyId, byGeneration] of this.#contributions) {
+      const live = [...byGeneration.keys()].filter((generationId) => {
+        const generation = this.#generations.get(generationId);
+        return generation !== undefined && !generation.quarantined;
+      });
+      if (live.length > 1) {
+        issues.push({
+          kind: 'duplicate-contribution',
+          capabilityId: keyId,
+          message: `contribution key ${keyId} is owned by ${live.length} live generations: ${live.join(', ')}`,
+        });
+      }
+    }
+    for (const generation of this.#generations.values()) {
+      const record = this.#plugins.get(generation.pluginId);
+      if (record === undefined || record.status !== 'active' || record.generation !== generation) {
+        issues.push({
+          kind: 'orphaned-generation',
+          pluginId: generation.pluginId,
+          generation: generation.id,
+          message: `generation ${generation.id} is published but not the active generation of ${generation.pluginId}`,
+        });
+        continue;
+      }
+      // Every non-optional requirement must resolve to a selectable
+      // provider right now, and every recorded provider edge must still
+      // satisfy its declared range.
+      for (const requirement of generation.definition.requires ?? []) {
+        const capabilityId = requirement.capability.id;
+        if (requirement.optional === true) {
+          continue;
+        }
+        if (!this.#hasSelectableProvider(capabilityId, requirement.range)) {
+          issues.push({
+            kind: 'unresolvable-requirement',
+            pluginId: generation.pluginId,
+            generation: generation.id,
+            capabilityId,
+            message: `${generation.pluginId} requires ${capabilityId}@${requirement.range} but no live provider satisfies it`,
+          });
+        }
+      }
+      for (const [capabilityId, providerIds] of generation.resolvedProviders) {
+        const declared = generation.consumed.find((entry) => entry.capabilityId === capabilityId);
+        for (const providerId of providerIds) {
+          const provider = this.#generations.get(providerId);
+          const binding = this.#published.get(capabilityId)?.get(providerId);
+          if (
+            declared !== undefined &&
+            provider !== undefined &&
+            binding !== undefined &&
+            !satisfiesRange(binding.capability.version, declared.range)
+          ) {
+            issues.push({
+              kind: 'range-mismatch',
+              pluginId: generation.pluginId,
+              generation: generation.id,
+              capabilityId,
+              message: `${generation.pluginId} bound ${capabilityId}@${binding.capability.version} from ${providerId}, which no longer satisfies ${declared.range}`,
+            });
+          }
+        }
+      }
+    }
+    return Object.freeze(issues);
+  }
+
+  planStart(id: string): StartPlan {
+    this.#assertUsable();
+    const record = this.#requireRecord(id);
+    if (record.status === 'active') {
+      return Object.freeze({
+        order: Object.freeze([]),
+        selections: Object.freeze([]),
+      });
+    }
+    let plan: ResolutionPlan;
+    try {
+      plan = resolve({
+        definitions: [...this.#plugins.values()].map((entry) => entry.definition),
+        statuses: this.#statuses(),
+        hostProviders: this.#hostProviders,
+        root: id,
+        quarantined: this.#quarantinedPluginIds(),
+        lazy: this.#lazyPluginIds(),
+      });
+    } catch (error) {
+      // Same error a real start() would surface; nothing was mutated and
+      // nothing was emitted — this is a dry run.
+      throw MoltError.from(error, 'ACTIVATION_FAILED');
+    }
+    const selections = plan.edges.map((edge) => {
+      const providers = plan.providers.get(edge.from)?.get(edge.capabilityId) ?? [];
+      return Object.freeze({
+        consumer: edge.from,
+        capabilityId: edge.capabilityId,
+        range: edge.range,
+        optional: edge.optional,
+        providers: Object.freeze(
+          providers.map((provider) =>
+            Object.freeze({ pluginId: provider.pluginId, version: provider.capabilityVersion }),
+          ),
+        ),
+      });
+    });
+    return Object.freeze({
+      order: Object.freeze([...plan.order]),
+      selections: Object.freeze(selections),
+    });
+  }
+
+  planStop(id: string, options?: { readonly cascade?: boolean | undefined }): StopPlan {
+    this.#assertUsable();
+    const record = this.#requireRecord(id);
+    if (record.status !== 'active' || record.generation === undefined) {
+      throw new MoltError({
+        code: 'INVALID_STATE',
+        message: `stop requires an active plugin (${id} is ${record.status})`,
+        pluginId: id,
+        details: { reason: 'not-active' },
+      });
+    }
+    const generation = record.generation;
+    const dependents = this.#activeDependentsOf(generation);
+    if (dependents.length > 0 && options?.cascade !== true) {
+      throw new MoltError({
+        code: 'ACTIVE_DEPENDENTS',
+        message: `plugin ${id} has active dependents; pass { cascade: true }`,
+        pluginId: id,
+        path: [...dependents.map((dependent) => dependent.pluginId), id],
+        details: { dependents: dependents.map((dependent) => dependent.pluginId) },
+      });
+    }
+    const closure = this.#stopClosure(generation);
+    return Object.freeze({
+      stopped: Object.freeze(closure.map((target) => target.pluginId)),
+    });
+  }
+
+  planReplace(
+    definition: PluginDefinition,
+    options?: { readonly strictDependents?: boolean | undefined },
+  ): ReplacePlan {
+    this.#assertUsable();
+    const failure = validateDefinition(definition);
+    if (failure !== undefined) {
+      throw failure;
+    }
+    const record = this.#plugins.get(definition.id);
+    if (record === undefined) {
+      throw new MoltError({
+        code: 'INVALID_STATE',
+        message: `replace requires an installed plugin (${definition.id})`,
+        pluginId: definition.id,
+        details: { reason: 'not-installed' },
+      });
+    }
+    if (record.status === 'preparing' || record.status === 'disposing') {
+      throw new MoltError({
+        code: 'INVALID_STATE',
+        message: `plugin is ${record.status}`,
+        pluginId: definition.id,
+        details: { reason: 'busy' },
+      });
+    }
+    const old = record.generation;
+    if (old === undefined) {
+      // No active generation to protect — replace would delegate to
+      // activation, rebounding nothing.
+      return Object.freeze({
+        replaced: definition.id,
+        rebound: Object.freeze([]),
+      });
+    }
+    const frozen = freezeDefinition(definition);
+    this.#validateReplacementClaims(frozen, old);
+    const closure = this.#dependentClosure(old);
+    if (closure.length > 0 && options?.strictDependents === true) {
+      const dependents = this.#activeDependentsOf(old);
+      throw new MoltError({
+        code: 'REPLACEMENT_FAILED',
+        message: `replacement of ${definition.id} has active dependents`,
+        pluginId: definition.id,
+        path: [...dependents.map((generation) => generation.pluginId), definition.id],
+        details: { dependents: dependents.map((generation) => generation.pluginId) },
+      });
+    }
+    return Object.freeze({
+      replaced: definition.id,
+      rebound: Object.freeze(closure.map((generation) => generation.pluginId)),
+    });
+  }
+
+  inspectDependents(id: string): readonly DependentInfo[] {
+    this.#assertUsable();
+    const record = this.#requireRecord(id);
+    const generation = record.generation;
+    if (generation === undefined) {
+      return Object.freeze([]);
+    }
+    const closure = this.#dependentClosure(generation);
+    return Object.freeze(
+      closure.map((dependent) =>
+        Object.freeze({ pluginId: dependent.pluginId, generation: dependent.id }),
+      ),
+    );
+  }
+
+  /**
+   * Whether a capability has a selectable provider right now, mirroring
+   * the resolver's eligibility including its tiers:
+   * - Tier 1: a host provider, or a published, non-quarantined live
+   *   generation, whose version satisfies the range.
+   * - Tier 2 (revival): a stopped plugin whose definition provides a
+   *   range-satisfying version — `start()` would revive it.
+   * Quarantined plugins and non-active lazy plugins stay excluded in both
+   * tiers, exactly as the resolver excludes them.
+   */
+  #hasSelectableProvider(capabilityId: string, range: string): boolean {
+    const host = this.#hostProviders.get(capabilityId);
+    // The resolver range-checks host candidates like any other provider:
+    // a host capability whose version misses the range is not selectable.
+    if (host !== undefined && satisfiesRange(host.capability.version, range)) {
+      return true;
+    }
+    const byGeneration = this.#published.get(capabilityId);
+    if (byGeneration !== undefined) {
+      for (const [generationId, binding] of byGeneration) {
+        const generation = this.#generations.get(generationId);
+        if (
+          generation === undefined ||
+          generation.quarantined ||
+          !satisfiesRange(binding.capability.version, range)
+        ) {
+          continue;
+        }
+        return true;
+      }
+    }
+    const quarantined = this.#quarantinedPluginIds();
+    const lazy = this.#lazyPluginIds();
+    for (const [id, record] of this.#plugins) {
+      if (record.status !== 'stopped' || quarantined.has(id)) {
+        continue;
+      }
+      if (lazy.has(id)) {
+        continue;
+      }
+      for (const provided of record.definition.provides ?? []) {
+        if (
+          provided.capability.id === capabilityId &&
+          satisfiesRange(provided.capability.version, range)
+        ) {
+          return true;
+        }
+      }
+    }
+    return false;
   }
 
   subscribe(listener: RuntimeListener): () => void {
@@ -831,6 +1586,9 @@ class RuntimeImpl implements Runtime {
           }
         }
         this.#withdraw(generation);
+      }
+      for (const pluginId of [...this.#pinned.keys()]) {
+        await this.#releasePin(pluginId, disposeMs);
       }
       this.#emit({ type: 'disposed' });
     };
@@ -888,20 +1646,35 @@ class RuntimeImpl implements Runtime {
         },
       );
     } catch (error) {
-      if (timedOut) {
-        // The drain overran its budget; disposal proceeds regardless.
+      const retiredRecord = this.#plugins.get(retired.pluginId);
+      if (retiredRecord === undefined) {
         return;
       }
-      const retiredRecord = this.#plugins.get(retired.pluginId);
-      if (retiredRecord !== undefined) {
+      // A drain problem is inspectable on the retired plugin's record, but
+      // it never overwrites a more important error already recorded there:
+      // the timeout especially is best-effort (disposal proceeds regardless),
+      // so a later disposal failure still wins the record.
+      if (retiredRecord.error !== undefined) {
+        return;
+      }
+      if (timedOut) {
+        // The drain overran its budget; disposal proceeds regardless.
         retiredRecord.error = new MoltError({
-          code: 'DISPOSAL_FAILED',
-          message: `drain of generation ${retired.id} failed`,
+          code: 'DISPOSAL_TIMEOUT',
+          message: `drain of generation ${retired.id} timed out after ${String(drainMs)}ms`,
           pluginId: retired.pluginId,
           generation: retired.id,
-          details: { reason: 'drain-failed', errors: [error] },
+          details: { reason: 'drain-timeout', timeoutMs: drainMs },
         });
+        return;
       }
+      retiredRecord.error = new MoltError({
+        code: 'DISPOSAL_FAILED',
+        message: `drain of generation ${retired.id} failed`,
+        pluginId: retired.pluginId,
+        generation: retired.id,
+        details: { reason: 'drain-failed', errors: [error] },
+      });
     }
   }
 
@@ -978,6 +1751,16 @@ class RuntimeImpl implements Runtime {
   }
 
   /**
+   * Entry gate for caller abort signals. An already-aborted signal rejects
+   * the operation with `ABORTED` before any state changes.
+   */
+  #assertNotAborted(signal: AbortSignal | undefined, pluginId?: string): void {
+    if (signal?.aborted === true) {
+      throw abortedError(pluginId);
+    }
+  }
+
+  /**
    * A lifecycle call for a plugin made from that plugin's own setup would
    * queue behind the in-flight activation and deadlock if awaited (F3).
    * `stop` short-circuits cooperatively in the public method; every other
@@ -1028,7 +1811,7 @@ class RuntimeImpl implements Runtime {
 
   // -- start / activation --------------------------------------------------------
 
-  async #start(id: string, timeouts: ResolvedTimeouts): Promise<void> {
+  async #start(id: string, timeouts: ResolvedTimeouts, signal?: AbortSignal): Promise<void> {
     this.#assertUsable();
     this.#assertNotRebindOwned(id);
     let record = this.#requireRecord(id);
@@ -1085,11 +1868,13 @@ class RuntimeImpl implements Runtime {
         statuses: this.#statuses(),
         hostProviders: this.#hostProviders,
         root: id,
+        quarantined: this.#quarantinedPluginIds(),
+        lazy: this.#lazyPluginIds(),
       });
     } catch (error) {
       record.status = 'stopped';
       record.error = MoltError.from(error, 'ACTIVATION_FAILED');
-      this.#emit({ type: 'failed', pluginId: id, error: record.error });
+      this.#emit({ type: 'failed', pluginId: id, error: record.error, stage: 'resolve' });
       throw record.error;
     }
 
@@ -1117,21 +1902,21 @@ class RuntimeImpl implements Runtime {
         if (target.status === 'active') {
           continue; // live providers are reused, never restarted
         }
-        const outcome = await this.#activateCoalesced(target, plan, timeouts);
+        const outcome = await this.#activateCoalesced(target, plan, timeouts, signal);
         if (outcome.created) {
           committed.push(outcome.generation);
         }
       }
-      const rootOutcome = await this.#activateCoalesced(record, plan, timeouts);
+      const rootOutcome = await this.#activateCoalesced(record, plan, timeouts, signal);
       if (rootOutcome.created) {
         committed.push(rootOutcome.generation);
       }
     } catch (error) {
       // Every generation committed by this attempt is disposed.
-      await this.#rollback(committed);
+      await this.#rollback(committed, timeouts.disposeMs);
       record.status = 'stopped';
       record.error = MoltError.from(error, 'ACTIVATION_FAILED');
-      this.#emit({ type: 'failed', pluginId: id, error: record.error });
+      this.#emit({ type: 'failed', pluginId: id, error: record.error, stage: 'setup' });
       throw record.error;
     }
   }
@@ -1148,6 +1933,7 @@ class RuntimeImpl implements Runtime {
     record: PluginRecord,
     plan: ResolutionPlan,
     timeouts: ResolvedTimeouts,
+    signal?: AbortSignal,
   ): Promise<{ generation: Generation; created: boolean }> {
     const pluginId = record.definition.id;
     // A concurrent start's provider loop must not double-prepare a plugin
@@ -1181,7 +1967,7 @@ class RuntimeImpl implements Runtime {
         details: { reason: 'removed-during-activation' },
       });
     }
-    const promise = this.#activate(record, plan, timeouts);
+    const promise = this.#activate(record, plan, timeouts, signal);
     // Registered synchronously: concurrent attempts observe it before any
     // await can interleave.
     this.#activations.set(pluginId, promise);
@@ -1205,6 +1991,7 @@ class RuntimeImpl implements Runtime {
     record: PluginRecord,
     plan: ResolutionPlan,
     timeouts: ResolvedTimeouts,
+    signal?: AbortSignal,
   ): Promise<Generation> {
     const definition = record.definition;
     const pluginId = definition.id;
@@ -1222,12 +2009,19 @@ class RuntimeImpl implements Runtime {
       prepared = await this.#prepareGeneration(definition, plan, {
         effectiveConfig: record.effectiveConfig,
         setupMs: timeouts.setupMs,
+        disposeMs: timeouts.disposeMs,
+        signal,
       });
     } catch (error) {
       record.status = 'stopped';
       record.generation = undefined;
       if (error instanceof PreparationFailure) {
-        throw activationError(error.failureCause, pluginId, error.generationId);
+        throw activationError(
+          error.failureCause,
+          pluginId,
+          error.generationId,
+          error.disposalErrors,
+        );
       }
       throw error;
     }
@@ -1279,7 +2073,12 @@ class RuntimeImpl implements Runtime {
     } catch (error) {
       // The scope is disposed so no resource leaks; the report is discarded
       // because the activation failure below carries the cause.
-      const report = await prepared.scope.dispose();
+      const report = await this.#disposeBounded(
+        prepared.scope,
+        pluginId,
+        generationId,
+        timeouts.disposeMs,
+      );
       void report;
       record.status = 'stopped';
       record.generation = undefined;
@@ -1297,10 +2096,16 @@ class RuntimeImpl implements Runtime {
       new Map(),
       plan,
     );
-    const health = await this.#runHealthCheck(generation, healthContext, timeouts.healthMs);
+    const health = await this.#runHealthCheck(generation, healthContext, timeouts.healthMs, signal);
+    generation.health = health.ok ? 'healthy' : 'unhealthy';
     if (!health.ok) {
       this.#withdraw(generation);
-      const disposeReport = await generation.scope.dispose();
+      const disposeReport = await this.#disposeBounded(
+        generation.scope,
+        pluginId,
+        generationId,
+        timeouts.disposeMs,
+      );
       void disposeReport;
       record.status = 'stopped';
       record.generation = undefined;
@@ -1328,6 +2133,7 @@ class RuntimeImpl implements Runtime {
     generation: Generation,
     context: PluginContext,
     healthMs: number | undefined,
+    signal?: AbortSignal,
   ): Promise<HealthStatus> {
     const hook = generation.definition.healthCheck;
     if (hook === undefined) {
@@ -1338,24 +2144,33 @@ class RuntimeImpl implements Runtime {
     let result: HealthStatus | undefined;
     let timedOut = false;
     try {
-      result = await withTimeout(
-        Promise.resolve().then(() => hook(context)),
-        healthMs,
-        () =>
-          // Unreachable in practice: onTimeout records the timeout and the
-          // resulting unhealthy status below; the error never escapes.
-          new MoltError({
-            code: 'INVALID_STATE',
-            message: `health check of plugin ${pluginId} timed out`,
-            pluginId,
-            generation: generationId,
-            details: { reason: 'health-timeout', timeoutMs: healthMs },
-          }),
-        () => {
-          timedOut = true;
-        },
+      result = await abortable(
+        withTimeout(
+          Promise.resolve().then(() => hook(context)),
+          healthMs,
+          () =>
+            // Unreachable in practice: onTimeout records the timeout and the
+            // resulting unhealthy status below; the error never escapes.
+            new MoltError({
+              code: 'INVALID_STATE',
+              message: `health check of plugin ${pluginId} timed out`,
+              pluginId,
+              generation: generationId,
+              details: { reason: 'health-timeout', timeoutMs: healthMs },
+            }),
+          () => {
+            timedOut = true;
+          },
+        ),
+        signal,
+        () => abortedError(pluginId),
       );
     } catch (error) {
+      // A caller abort is cancellation, not an unhealthy verdict — it must
+      // propagate instead of being recorded as a failed probe.
+      if (isMoltError(error) && error.code === 'ABORTED') {
+        throw error;
+      }
       if (timedOut) {
         return { ok: false, message: `health check timed out after ${String(healthMs)}ms` };
       }
@@ -1405,6 +2220,10 @@ class RuntimeImpl implements Runtime {
       rebindOverlay: options.rebindOverlay,
       config: options.effectiveConfig,
       plan,
+      health: 'unknown',
+      quarantined: false,
+      quarantinedState: undefined,
+      pinned: false,
     };
     this.#preparing.set(pluginId, generation);
     const staged = new StagedContributions(pluginId, generationId);
@@ -1419,17 +2238,21 @@ class RuntimeImpl implements Runtime {
       // recognized as self-operations (F3). Bounded by the setup timeout:
       // on expiry the candidate scope is disposed (aborting its signal)
       // and the preparation fails with SETUP_TIMEOUT.
-      const returned = await withTimeout(
-        Promise.resolve(setupTracker.run({ pluginId }, () => definition.setup(context))),
-        setupMs,
-        () =>
-          new MoltError({
-            code: 'SETUP_TIMEOUT',
-            message: `setup of plugin ${pluginId} timed out`,
-            pluginId,
-            generation: generationId,
-            details: { reason: 'setup-timeout', timeoutMs: setupMs },
-          }),
+      const returned = await abortable(
+        withTimeout(
+          Promise.resolve(setupTracker.run({ pluginId }, () => definition.setup(context))),
+          setupMs,
+          () =>
+            new MoltError({
+              code: 'SETUP_TIMEOUT',
+              message: `setup of plugin ${pluginId} timed out`,
+              pluginId,
+              generation: generationId,
+              details: { reason: 'setup-timeout', timeoutMs: setupMs },
+            }),
+        ),
+        options.signal,
+        () => abortedError(pluginId),
       );
       if (adoptable(returned)) {
         // A returned disposer is adopted before any validation or
@@ -1481,24 +2304,28 @@ class RuntimeImpl implements Runtime {
           stateVersion: shadowed.definition.stateVersion,
           provided,
         };
-        await withTimeout(
-          Promise.resolve(
-            setupTracker.run({ pluginId }, () =>
-              migrate(
-                previous,
-                this.#migrateContext(definition, generation, stagedProvides, context),
+        await abortable(
+          withTimeout(
+            Promise.resolve(
+              setupTracker.run({ pluginId }, () =>
+                migrate(
+                  previous,
+                  this.#migrateContext(definition, generation, stagedProvides, context),
+                ),
               ),
             ),
+            setupMs,
+            () =>
+              new MoltError({
+                code: 'SETUP_TIMEOUT',
+                message: `migration of plugin ${pluginId} timed out`,
+                pluginId,
+                generation: generationId,
+                details: { reason: 'migrate-timeout', timeoutMs: setupMs },
+              }),
           ),
-          setupMs,
-          () =>
-            new MoltError({
-              code: 'SETUP_TIMEOUT',
-              message: `migration of plugin ${pluginId} timed out`,
-              pluginId,
-              generation: generationId,
-              details: { reason: 'migrate-timeout', timeoutMs: setupMs },
-            }),
+          options.signal,
+          () => abortedError(pluginId),
         );
         if (scope.isDisposed()) {
           // A self-stop from the hook disposes the candidate scope via the
@@ -1538,7 +2365,7 @@ class RuntimeImpl implements Runtime {
       );
       return { generation, scope, stagedProvides, staged };
     } catch (error) {
-      const report = await scope.dispose();
+      const report = await this.#disposeBounded(scope, pluginId, generationId, options.disposeMs);
       throw new PreparationFailure(generationId, error, report.errors);
     } finally {
       this.#preparing.delete(pluginId);
@@ -1599,6 +2426,15 @@ class RuntimeImpl implements Runtime {
     if (failure !== undefined) {
       throw failure;
     }
+    const inFlight = options?.inFlight ?? 'drain';
+    if (inFlight !== 'drain' && inFlight !== 'immediate' && inFlight !== 'pin') {
+      throw new MoltError({
+        code: 'INVALID_DEFINITION',
+        message: `invalid inFlight policy: ${String(options?.inFlight)}`,
+        pluginId: definition.id,
+        details: { reason: 'invalid-inFlight' },
+      });
+    }
     const record = this.#plugins.get(definition.id);
     if (record === undefined) {
       throw new MoltError({
@@ -1625,7 +2461,7 @@ class RuntimeImpl implements Runtime {
       newEffectiveConfig = resolveConfig(frozen, record.configOverrides, 'INVALID_DEFINITION');
     } catch (error) {
       record.error = this.#replacementFailure(error, definition.id);
-      this.#emit({ type: 'failed', pluginId: definition.id, error: record.error });
+      this.#emit({ type: 'failed', pluginId: definition.id, error: record.error, stage: 'config' });
       throw record.error;
     }
     const old = record.generation;
@@ -1673,7 +2509,12 @@ class RuntimeImpl implements Runtime {
       this.#validateReplacementClaims(frozen, old);
     } catch (error) {
       record.error = this.#replacementFailure(error, definition.id);
-      this.#emit({ type: 'failed', pluginId: definition.id, error: record.error });
+      this.#emit({
+        type: 'failed',
+        pluginId: definition.id,
+        error: record.error,
+        stage: 'validate',
+      });
       throw record.error;
     }
 
@@ -1691,7 +2532,12 @@ class RuntimeImpl implements Runtime {
       candidatePlan = resolveCandidate({ definition: frozen, providers });
     } catch (error) {
       record.error = this.#replacementFailure(error, definition.id);
-      this.#emit({ type: 'failed', pluginId: definition.id, error: record.error });
+      this.#emit({
+        type: 'failed',
+        pluginId: definition.id,
+        error: record.error,
+        stage: 'resolve',
+      });
       throw record.error;
     }
 
@@ -1783,9 +2629,11 @@ class RuntimeImpl implements Runtime {
           providerItem.plan,
           {
             shadowed: providerItem.old,
+            disposeMs: timeouts.disposeMs,
             rebindOverlay: overlay,
             effectiveConfig: newEffectiveConfig,
             setupMs: timeouts.setupMs,
+            signal: options?.signal,
           },
         );
         prepared.push(providerItem.prepared);
@@ -1813,11 +2661,13 @@ class RuntimeImpl implements Runtime {
           const dependentRecord = this.#plugins.get(item.old.pluginId);
           item.prepared = await this.#prepareGeneration(item.definition, plan, {
             shadowed: item.old,
+            disposeMs: timeouts.disposeMs,
             rebindOverlay: overlay,
             // Dependents keep their own definitions and configurations; only
             // the replaced plugin's config changes.
             effectiveConfig: dependentRecord?.effectiveConfig ?? EMPTY_CONFIG,
             setupMs: timeouts.setupMs,
+            signal: options?.signal,
           });
           prepared.push(item.prepared);
           this.#stageRebindBindings(item.prepared, overlay);
@@ -1836,7 +2686,12 @@ class RuntimeImpl implements Runtime {
         // withdrawn, so there is nothing to restore.
         const disposalErrors: unknown[] = [];
         for (const candidate of [...prepared].reverse()) {
-          const report = await candidate.scope.dispose();
+          const report = await this.#disposeBounded(
+            candidate.scope,
+            candidate.generation.pluginId,
+            candidate.generation.id,
+            timeouts.disposeMs,
+          );
           disposalErrors.push(...report.errors);
         }
         if (error instanceof PreparationFailure) {
@@ -1849,7 +2704,12 @@ class RuntimeImpl implements Runtime {
         } else {
           record.error = this.#replacementFailure(error, definition.id, undefined, disposalErrors);
         }
-        this.#emit({ type: 'failed', pluginId: definition.id, error: record.error });
+        this.#emit({
+          type: 'failed',
+          pluginId: definition.id,
+          error: record.error,
+          stage: 'prepare',
+        });
         throw record.error;
       }
 
@@ -1876,9 +2736,15 @@ class RuntimeImpl implements Runtime {
           new Map(),
           entry.plan,
         );
-        const health = await this.#runHealthCheck(candidate, healthContext, timeouts.healthMs);
+        const health = await this.#runHealthCheck(
+          candidate,
+          healthContext,
+          timeouts.healthMs,
+          options?.signal,
+        );
+        candidate.health = health.ok ? 'healthy' : 'unhealthy';
         if (!health.ok) {
-          await this.#rollbackRebind(committed);
+          await this.#rollbackRebind(committed, timeouts.disposeMs);
           record.error = this.#replacementFailure(
             new MoltError({
               code: 'REPLACEMENT_FAILED',
@@ -1890,7 +2756,12 @@ class RuntimeImpl implements Runtime {
             definition.id,
             candidate.id,
           );
-          this.#emit({ type: 'failed', pluginId: definition.id, error: record.error });
+          this.#emit({
+            type: 'failed',
+            pluginId: definition.id,
+            error: record.error,
+            stage: 'health',
+          });
           throw record.error;
         }
       }
@@ -1914,14 +2785,31 @@ class RuntimeImpl implements Runtime {
       }
 
       // Only after a successful commit: retire the old scopes, dependents
-      // first (reverse provider-first order, mirroring cascade stop). Each
-      // old generation's `drain` hook runs before its disposers, bounded by
-      // the drain timeout — expiry aborts the drain and disposal proceeds
-      // regardless. A disposal failure here is inspectable on the retired
-      // plugin's record; the replacement already succeeded and is never
-      // rolled back.
+      // first (reverse provider-first order, mirroring cascade stop). The
+      // in-flight policy selects the treatment:
+      // - 'drain' (default): the `drain` hook runs before the disposers,
+      //   bounded by the drain timeout — expiry aborts the drain and
+      //   disposal proceeds regardless.
+      // - 'immediate': the drain hook is skipped, scopes are disposed at
+      //   once.
+      // - 'pin': scopes are kept alive for existing holders (no drain, no
+      //   dispose); at most one pinned generation per plugin.
+      // A disposal failure here is inspectable on the retired plugin's
+      // record; the replacement already succeeded and is never rolled back.
       for (const retired of [...oldsInOrder].reverse()) {
-        await this.#drainGeneration(retired, timeouts.drainMs);
+        // A quarantined generation never returns to selection: drop the
+        // stash instead of leaving it dangling on a retired generation.
+        if (retired.quarantined) {
+          retired.quarantined = false;
+          retired.quarantinedState = undefined;
+        }
+        if (inFlight === 'pin') {
+          await this.#pinGeneration(retired, timeouts.disposeMs);
+          continue;
+        }
+        if (inFlight === 'drain') {
+          await this.#drainGeneration(retired, timeouts.drainMs);
+        }
         const report = await this.#disposeBounded(
           retired.scope,
           retired.pluginId,
@@ -1971,20 +2859,7 @@ class RuntimeImpl implements Runtime {
       });
     }
 
-    // Reverse dependency order: dependents first, deterministic.
-    const closure: Generation[] = [];
-    const visited = new Set<string>([generation.id]);
-    const visit = (target: Generation): void => {
-      for (const dependent of this.#activeDependentsOf(target)) {
-        if (!visited.has(dependent.id)) {
-          visited.add(dependent.id);
-          visit(dependent);
-          closure.push(dependent);
-        }
-      }
-    };
-    visit(generation);
-    closure.push(generation);
+    const closure = this.#stopClosure(generation);
 
     const stoppedIds: string[] = [];
     for (const target of closure) {
@@ -2007,6 +2882,9 @@ class RuntimeImpl implements Runtime {
       }
       this.#withdraw(target);
       stoppedIds.push(target.pluginId);
+      // A stopped plugin releases its pin: nothing is active anymore, and
+      // the host asked for teardown.
+      await this.#releasePin(target.pluginId, disposeMs);
       this.#emit({
         type: 'stopped',
         pluginId: target.pluginId,
@@ -2018,9 +2896,32 @@ class RuntimeImpl implements Runtime {
     }
   }
 
+  /**
+   * The stop closure for a generation: transitive active dependents first
+   * (dependents before the providers they resolved), then the generation
+   * itself. Shared by `#stop` and `planStop`.
+   */
+  #stopClosure(generation: Generation): Generation[] {
+    // Reverse dependency order: dependents first, deterministic.
+    const closure: Generation[] = [];
+    const visited = new Set<string>([generation.id]);
+    const visit = (target: Generation): void => {
+      for (const dependent of this.#activeDependentsOf(target)) {
+        if (!visited.has(dependent.id)) {
+          visited.add(dependent.id);
+          visit(dependent);
+          closure.push(dependent);
+        }
+      }
+    };
+    visit(generation);
+    closure.push(generation);
+    return closure;
+  }
+
   // -- uninstall -----------------------------------------------------------------
 
-  #uninstall(id: string): void {
+  async #uninstall(id: string, disposeMs: number | undefined): Promise<void> {
     this.#assertUsable();
     this.#assertNotRebindOwned(id);
     const record = this.#plugins.get(id);
@@ -2049,6 +2950,8 @@ class RuntimeImpl implements Runtime {
         pluginId: id,
       });
     }
+    // Uninstalling drops the plugin entirely, pins included.
+    await this.#releasePin(id, disposeMs);
     this.#plugins.delete(id);
   }
 
@@ -2090,6 +2993,11 @@ class RuntimeImpl implements Runtime {
     generation?: string,
     disposalErrors: readonly unknown[] = [],
   ): MoltError {
+    // Cancellation is not a candidate failure: a caller-aborted replace
+    // surfaces ABORTED so hosts can distinguish it from a bad candidate.
+    if (isMoltError(error) && error.code === 'ABORTED') {
+      return error;
+    }
     const details = disposalErrors.length > 0 ? { disposalErrors } : undefined;
     return new MoltError(
       {
@@ -2875,10 +3783,16 @@ class RuntimeImpl implements Runtime {
       oldBindings: Map<string, PublishedBinding>;
       oldContributions: Map<string, ContributionEntry>;
     }[],
+    disposeMs: number | undefined,
   ): Promise<void> {
     for (const entry of [...committed].reverse()) {
       this.#withdraw(entry.prepared.generation);
-      const report = await entry.prepared.scope.dispose();
+      const report = await this.#disposeBounded(
+        entry.prepared.scope,
+        entry.prepared.generation.pluginId,
+        entry.prepared.generation.id,
+        disposeMs,
+      );
       void report;
     }
     for (const entry of committed) {
@@ -2984,6 +3898,136 @@ class RuntimeImpl implements Runtime {
     return dependents;
   }
 
+  /**
+   * Pin a retired generation: withdrawn from provider selection (already
+   * done at commit), scope kept alive for existing external holders. At
+   * most one pin per plugin — a previous pin is disposed first. Emits
+   * `stopped` for the superseded pin, if any.
+   */
+  async #pinGeneration(generation: Generation, disposeMs: number | undefined): Promise<void> {
+    const previous = this.#pinned.get(generation.pluginId);
+    if (previous !== undefined && previous !== generation) {
+      await this.#releasePin(generation.pluginId, disposeMs);
+    }
+    generation.pinned = true;
+    this.#pinned.set(generation.pluginId, generation);
+    this.#logTransition('pinned', generation.pluginId, generation.id);
+  }
+
+  /**
+   * Release a plugin's pinned generation, if any: dispose its scope
+   * (bounded) and emit `stopped`. Disposal errors are recorded on the
+   * plugin's record like any post-commit disposal failure.
+   */
+  async #releasePin(pluginId: string, disposeMs: number | undefined): Promise<void> {
+    const pinned = this.#pinned.get(pluginId);
+    if (pinned === undefined) {
+      return;
+    }
+    this.#pinned.delete(pluginId);
+    pinned.pinned = false;
+    const report = await this.#disposeBounded(pinned.scope, pinned.pluginId, pinned.id, disposeMs);
+    if (report.errors.length > 0) {
+      const record = this.#plugins.get(pluginId);
+      if (record !== undefined) {
+        record.error = this.#disposalFailure(pinned, report);
+      }
+    }
+    this.#emit({ type: 'stopped', pluginId: pinned.pluginId, generation: pinned.id });
+  }
+
+  /**
+   * Quarantine a live generation: it is withdrawn from provider selection
+   * (bindings and contributions are stashed, not dropped) while its scope
+   * stays alive — existing holders keep serving, new `require()` calls no
+   * longer resolve to it. Idempotent.
+   */
+  #quarantineGeneration(generation: Generation): void {
+    if (generation.quarantined) {
+      return;
+    }
+    generation.quarantined = true;
+    this.#logTransition('quarantined', generation.pluginId, generation.id);
+    const bindings: { readonly tokenId: string; readonly binding: PublishedBinding }[] = [];
+    for (const tokenId of generation.providedTokenIds) {
+      const byGeneration = this.#published.get(tokenId);
+      if (byGeneration === undefined) {
+        continue;
+      }
+      const binding = byGeneration.get(generation.id);
+      if (binding !== undefined) {
+        bindings.push({ tokenId, binding });
+        byGeneration.delete(generation.id);
+        if (byGeneration.size === 0) {
+          this.#published.delete(tokenId);
+        }
+      }
+    }
+    const contributions: { readonly keyId: string; readonly entry: ContributionEntry }[] = [];
+    for (const [keyId, byGeneration] of this.#contributions) {
+      const entry = byGeneration.get(generation.id);
+      if (entry !== undefined) {
+        contributions.push({ keyId, entry });
+        byGeneration.delete(generation.id);
+        if (byGeneration.size === 0) {
+          this.#contributions.delete(keyId);
+        }
+      }
+    }
+    generation.quarantinedState = { bindings, contributions };
+  }
+
+  /**
+   * Lift a quarantine: the stashed bindings and contributions are
+   * republished. Throws `AMBIGUOUS_PROVIDER` — leaving the quarantine in
+   * place — when another generation claimed one of the stashed
+   * single-provider capabilities while this generation was quarantined.
+   */
+  #unquarantineGeneration(generation: Generation): void {
+    if (!generation.quarantined) {
+      return;
+    }
+    // The transition is logged only after the restoration commits: the
+    // conflict check below can throw AMBIGUOUS_PROVIDER, and the log must
+    // never claim an unquarantine that did not happen.
+    const stashed = generation.quarantinedState;
+    if (stashed !== undefined) {
+      for (const { tokenId, binding } of stashed.bindings) {
+        const byGeneration = this.#published.get(tokenId);
+        if (!binding.capability.multiple && byGeneration !== undefined && byGeneration.size > 0) {
+          throw new MoltError({
+            code: 'AMBIGUOUS_PROVIDER',
+            message:
+              `cannot unquarantine ${generation.pluginId}: capability ` +
+              `${binding.capability.id} was claimed while quarantined`,
+            pluginId: generation.pluginId,
+            generation: generation.id,
+            capabilityId: binding.capability.id,
+          });
+        }
+      }
+      for (const { tokenId, binding } of stashed.bindings) {
+        let byGeneration = this.#published.get(tokenId);
+        if (byGeneration === undefined) {
+          byGeneration = new Map<string, PublishedBinding>();
+          this.#published.set(tokenId, byGeneration);
+        }
+        byGeneration.set(generation.id, binding);
+      }
+      for (const { keyId, entry } of stashed.contributions) {
+        let byGeneration = this.#contributions.get(keyId);
+        if (byGeneration === undefined) {
+          byGeneration = new Map<string, ContributionEntry>();
+          this.#contributions.set(keyId, byGeneration);
+        }
+        byGeneration.set(generation.id, entry);
+      }
+    }
+    generation.quarantined = false;
+    generation.quarantinedState = undefined;
+    this.#logTransition('unquarantined', generation.pluginId, generation.id);
+  }
+
   #withdraw(generation: Generation): void {
     for (const tokenId of generation.providedTokenIds) {
       const byGeneration = this.#published.get(tokenId);
@@ -3044,6 +4088,35 @@ class RuntimeImpl implements Runtime {
     return statuses;
   }
 
+  /**
+   * Ids of plugins whose active generation is quarantined: excluded from
+   * provider selection in the next resolution.
+   */
+  #quarantinedPluginIds(): Set<string> {
+    const ids = new Set<string>();
+    for (const [id, record] of this.#plugins) {
+      if (record.generation?.quarantined === true) {
+        ids.add(id);
+      }
+    }
+    return ids;
+  }
+
+  /**
+   * Ids of plugins installed lazy. The resolver excludes them from
+   * provider selection until they have been explicitly started (the
+   * resolver consults the status map to make that determination).
+   */
+  #lazyPluginIds(): Set<string> {
+    const ids = new Set<string>();
+    for (const [id, record] of this.#plugins) {
+      if (record.lazy === true) {
+        ids.add(id);
+      }
+    }
+    return ids;
+  }
+
   #requireRecord(id: string): PluginRecord {
     const record = this.#plugins.get(id);
     if (record === undefined) {
@@ -3057,14 +4130,14 @@ class RuntimeImpl implements Runtime {
     return record;
   }
 
-  async #rollback(committed: Generation[]): Promise<void> {
+  async #rollback(committed: Generation[], disposeMs: number | undefined): Promise<void> {
     // Every resource acquired by the failed activation attempt is
     // disposed; failures are collected, teardown continues. Each committed
     // generation emitted 'started' at commit, so each disposal emits the
     // balancing 'stopped' — observers never see an unbalanced stream (F8).
     for (const generation of [...committed].reverse()) {
       if (!generation.scope.isDisposed()) {
-        await generation.scope.dispose();
+        await this.#disposeBounded(generation.scope, generation.pluginId, generation.id, disposeMs);
       }
       this.#withdraw(generation);
       const record = this.#plugins.get(generation.pluginId);
@@ -3076,7 +4149,34 @@ class RuntimeImpl implements Runtime {
     }
   }
 
+  /**
+   * Appends a transition to the bounded audit log, evicting the oldest
+   * entries beyond the capacity. The stored record is frozen.
+   */
+  #logTransition(
+    type: TransitionRecord['type'],
+    pluginId?: string,
+    generation?: string,
+    error?: unknown,
+    stage?: FailedStage,
+  ): void {
+    const record: TransitionRecord = Object.freeze({
+      seq: this.#transitionSeq++,
+      at: Date.now(),
+      type,
+      pluginId,
+      generation,
+      error,
+      stage,
+    });
+    this.#transitions.push(record);
+    while (this.#transitions.length > TRANSITION_CAPACITY) {
+      this.#transitions.shift();
+    }
+  }
+
   #emit(event: RuntimeEvent): void {
+    this.#logTransition(event.type, event.pluginId, event.generation, event.error, event.stage);
     const snapshot = Object.freeze({ ...event });
     // The reentrancy guard is a stack: a listener that emits synchronously
     // (e.g. an observer that installs another plugin) pushes its own
@@ -3163,7 +4263,22 @@ function cloneDiagnosticValue(value: unknown): unknown {
   return value;
 }
 
-function activationError(error: unknown, pluginId: string, generationId: string): MoltError {
+function abortedError(pluginId?: string): MoltError {
+  return new MoltError({
+    code: 'ABORTED',
+    message: `operation aborted${pluginId !== undefined ? ` for ${pluginId}` : ''}`,
+    ...(pluginId !== undefined ? { pluginId } : {}),
+    details: { reason: 'aborted' },
+  });
+}
+
+function activationError(
+  error: unknown,
+  pluginId: string,
+  generationId: string,
+  disposalErrors: readonly unknown[] = [],
+): MoltError {
+  const details = disposalErrors.length > 0 ? { disposalErrors: [...disposalErrors] } : undefined;
   if (isMoltError(error)) {
     if (
       error.code === 'INVALID_STATE' &&
@@ -3176,12 +4291,30 @@ function activationError(error: unknown, pluginId: string, generationId: string)
           message: `setup was interrupted for ${pluginId}`,
           pluginId,
           generation: generationId,
+          ...(details !== undefined ? { details } : {}),
         },
         error,
       );
     }
-    // Structured errors thrown by provide/contribute already carry identity.
-    return error;
+    // Structured errors thrown by provide/contribute already carry identity
+    // and pass through unchanged — unless cleaning up the failed candidate
+    // also failed, in which case the wrapper preserves the original code
+    // and identity and records the disposal failures in details.
+    if (details === undefined) {
+      return error;
+    }
+    return new MoltError(
+      {
+        code: error.code,
+        message: error.message,
+        pluginId: error.pluginId ?? pluginId,
+        generation: error.generation ?? generationId,
+        capabilityId: error.capabilityId,
+        path: error.path === undefined ? undefined : [...error.path],
+        details,
+      },
+      error,
+    );
   }
   const message = error instanceof Error ? error.message : String(error);
   return new MoltError(
@@ -3190,6 +4323,7 @@ function activationError(error: unknown, pluginId: string, generationId: string)
       message: `setup failed: ${message}`,
       pluginId,
       generation: generationId,
+      ...(details !== undefined ? { details } : {}),
     },
     error,
   );

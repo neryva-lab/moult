@@ -15,6 +15,7 @@
     "packages/test/src",
     "packages/events/src",
     "packages/react/src",
-    "packages/vite/src"
+    "packages/vite/src",
+    "packages/verify/src"
   ]
 }

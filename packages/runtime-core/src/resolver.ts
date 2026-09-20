@@ -75,7 +75,7 @@ export interface BlockedDiagnostic {
     /** Capability version offered by the provider. */
     readonly version: string;
     /** Why the provider was or was not selectable. */
-    readonly verdict: 'incompatible' | 'stopped' | 'ok';
+    readonly verdict: 'incompatible' | 'stopped' | 'quarantined' | 'lazy' | 'ok';
   }[];
 }
 
@@ -99,6 +99,17 @@ export interface ResolutionInput {
    * rather than "can it activate right now?".
    */
   readonly ignoreStopped?: boolean | undefined;
+  /**
+   * Plugin ids whose active generation is quarantined: excluded from
+   * provider selection. The root itself is always selectable.
+   */
+  readonly quarantined?: ReadonlySet<string> | undefined;
+  /**
+   * Plugin ids installed lazy that have never been explicitly started:
+   * excluded from provider selection. The root itself is always
+   * selectable, and a lazy plugin that is already active selects normally.
+   */
+  readonly lazy?: ReadonlySet<string> | undefined;
 }
 
 interface Candidate {
@@ -109,6 +120,12 @@ interface Candidate {
    * 2 = stopped fallback, revived only when no tier-1 candidate exists.
    */
   readonly tier: 1 | 2;
+  /**
+   * Set when the candidate is excluded from selection: a quarantined
+   * generation, or a lazy plugin that was never explicitly started.
+   * Excluded candidates appear in diagnostics but are never selected.
+   */
+  readonly excluded?: 'quarantined' | 'lazy' | undefined;
 }
 
 const HOST_EDGE_TARGET = '(host)';
@@ -132,11 +149,14 @@ function blockedDiagnostic(
     candidates: candidates.map((candidate) => ({
       pluginId: candidate.pluginId,
       version: candidate.capabilityVersion,
-      verdict: !compatible.includes(candidate)
-        ? 'incompatible'
-        : selected.includes(candidate)
-          ? 'ok'
-          : 'stopped',
+      verdict:
+        candidate.excluded !== undefined
+          ? candidate.excluded
+          : !compatible.includes(candidate)
+            ? 'incompatible'
+            : selected.includes(candidate)
+              ? 'ok'
+              : 'stopped',
     })),
   };
 }
@@ -212,6 +232,8 @@ class StringHeap {
 export function resolve(input: ResolutionInput): ResolutionPlan {
   const { definitions, statuses, hostProviders, root } = input;
   const ignoreStopped = input.ignoreStopped === true;
+  const quarantined = input.quarantined;
+  const lazy = input.lazy;
 
   // 1–2: defensive re-validation and duplicate rejection (install validates
   // already; the resolver never trusts its input).
@@ -262,11 +284,23 @@ export function resolve(input: ResolutionInput): ResolutionPlan {
     const isRoot = id === root;
     const status = statuses.get(id);
     const tier: 1 | 2 = isRoot || ignoreStopped || status !== 'stopped' ? 1 : 2;
+    // Quarantined generations and never-started lazy plugins are excluded
+    // from selection (the root is always selectable); they stay in the
+    // pool so diagnostics can explain the exclusion.
+    const excluded: 'quarantined' | 'lazy' | undefined =
+      isRoot || ignoreStopped
+        ? undefined
+        : quarantined?.has(id) === true
+          ? 'quarantined'
+          : lazy?.has(id) === true && status !== 'active'
+            ? 'lazy'
+            : undefined;
     for (const provided of definition.provides ?? []) {
       addCandidate(provided.capability.id, {
         pluginId: id,
         capabilityVersion: provided.capability.version,
         tier,
+        excluded,
       });
     }
   }
@@ -305,8 +339,11 @@ export function resolve(input: ResolutionInput): ResolutionPlan {
       );
       // Tiered selection: active providers win; stopped providers are
       // revived only when no tier-1 candidate satisfies the requirement.
-      const tier1 = compatible.filter((candidate) => candidate.tier === 1);
-      const tier2 = compatible.filter((candidate) => candidate.tier === 2);
+      // Excluded candidates (quarantined, never-started lazy) are never
+      // selectable, in either tier.
+      const eligible = compatible.filter((candidate) => candidate.excluded === undefined);
+      const tier1 = eligible.filter((candidate) => candidate.tier === 1);
+      const tier2 = eligible.filter((candidate) => candidate.tier === 2);
       const selectable = tier1.length > 0 ? tier1 : tier2;
       // Diagnostics are built lazily: the happy path records none.
       const diagnostic = (): BlockedDiagnostic =>
@@ -346,6 +383,16 @@ export function resolve(input: ResolutionInput): ResolutionPlan {
             details: { blocked: [diagnostic()] },
           });
         }
+        // Every compatible provider is excluded (quarantined or
+        // never-started lazy): the capability exists but is unavailable.
+        // The diagnostic verdicts name the exclusion.
+        throw new MoltError({
+          code: 'MISSING_CAPABILITY',
+          message: `no selectable provider for capability ${capabilityId}`,
+          pluginId: definition.id,
+          capabilityId,
+          details: { blocked: [diagnostic()] },
+        });
       }
 
       if (selectable.length > 1 && requirement.capability.multiple !== true) {

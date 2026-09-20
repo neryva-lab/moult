@@ -9,7 +9,7 @@ export interface BlockedDiagnostic {
     readonly candidates: readonly {
         readonly pluginId: string | null;
         readonly version: string;
-        readonly verdict: 'incompatible' | 'stopped' | 'ok';
+        readonly verdict: 'incompatible' | 'stopped' | 'quarantined' | 'lazy' | 'ok';
     }[];
     readonly pluginId: string;
     readonly requirement: {
@@ -65,6 +65,14 @@ export interface ContributionSnapshot {
 export function createRuntime(options?: RuntimeOptions): Runtime;
 
 // @public
+export interface DependentInfo {
+    // (undocumented)
+    readonly generation: string;
+    // (undocumented)
+    readonly pluginId: string;
+}
+
+// @public
 export interface DiagnosticInput {
     // (undocumented)
     readonly details?: Readonly<Record<string, unknown>> | undefined;
@@ -95,6 +103,23 @@ export interface DrainContext {
 }
 
 // @public
+export type FailedStage = 'resolve' | 'validate' | 'config' | 'setup' | 'prepare' | 'health';
+
+// @public
+export interface GraphIssue {
+    // (undocumented)
+    readonly capabilityId?: string | undefined;
+    // (undocumented)
+    readonly generation?: string | undefined;
+    // (undocumented)
+    readonly kind: 'unresolvable-requirement' | 'range-mismatch' | 'duplicate-provider' | 'duplicate-contribution' | 'stale-binding' | 'orphaned-generation';
+    // (undocumented)
+    readonly message: string;
+    // (undocumented)
+    readonly pluginId?: string | undefined;
+}
+
+// @public
 export interface HealthStatus {
     // (undocumented)
     readonly message?: string | undefined;
@@ -105,6 +130,8 @@ export interface HealthStatus {
 // @public
 export interface InstallOptions {
     readonly config?: Record<string, unknown> | undefined;
+    readonly lazy?: boolean | undefined;
+    readonly signal?: AbortSignal | undefined;
 }
 
 // @public
@@ -206,8 +233,18 @@ export interface ProvidedCapability {
 
 // @public
 export interface ReplaceOptions {
+    readonly inFlight?: 'drain' | 'immediate' | 'pin' | undefined;
+    readonly signal?: AbortSignal | undefined;
     readonly strictDependents?: boolean | undefined;
     readonly timeoutMs?: number | undefined;
+}
+
+// @public
+export interface ReplacePlan {
+    // (undocumented)
+    readonly rebound: readonly string[];
+    // (undocumented)
+    readonly replaced: string;
 }
 
 // @public
@@ -233,8 +270,15 @@ export interface Runtime {
     getStatus(id: string): PluginStatus | undefined;
     // (undocumented)
     inspect(): RuntimeInspection;
-    // (undocumented)
+    inspectDependents(id: string): readonly DependentInfo[];
     install(definition: PluginDefinition, options?: InstallOptions): void;
+    planReplace(definition: PluginDefinition, options?: {
+        readonly strictDependents?: boolean | undefined;
+    }): ReplacePlan;
+    planStart(id: string): StartPlan;
+    planStop(id: string, options?: {
+        readonly cascade?: boolean | undefined;
+    }): StopPlan;
     // (undocumented)
     replace(definition: PluginDefinition, options?: ReplaceOptions): Promise<void>;
     rollback(id: string): Promise<void>;
@@ -244,13 +288,14 @@ export interface Runtime {
     stop(id: string, options?: StopOptions): Promise<void>;
     // (undocumented)
     subscribe(listener: RuntimeListener): () => void;
-    // (undocumented)
-    uninstall(id: string): Promise<void>;
+    transitions(): readonly TransitionRecord[];
+    uninstall(id: string, options?: UninstallOptions): Promise<void>;
     updateConfig(id: string, patch: Record<string, unknown>): void;
+    validate(): readonly GraphIssue[];
 }
 
 // @public
-export type RuntimeErrorCode = 'DUPLICATE_PLUGIN' | 'INVALID_DEFINITION' | 'MISSING_CAPABILITY' | 'INCOMPATIBLE_CAPABILITY' | 'AMBIGUOUS_PROVIDER' | 'DEPENDENCY_CYCLE' | 'ACTIVE_DEPENDENTS' | 'ACTIVATION_FAILED' | 'DISPOSAL_FAILED' | 'REPLACEMENT_FAILED' | 'SETUP_TIMEOUT' | 'DISPOSAL_TIMEOUT' | 'INVALID_STATE';
+export type RuntimeErrorCode = 'DUPLICATE_PLUGIN' | 'INVALID_DEFINITION' | 'MISSING_CAPABILITY' | 'INCOMPATIBLE_CAPABILITY' | 'AMBIGUOUS_PROVIDER' | 'DEPENDENCY_CYCLE' | 'ACTIVE_DEPENDENTS' | 'ACTIVATION_FAILED' | 'DISPOSAL_FAILED' | 'REPLACEMENT_FAILED' | 'SETUP_TIMEOUT' | 'DISPOSAL_TIMEOUT' | 'ABORTED' | 'INVALID_STATE';
 
 // @public
 export interface RuntimeInspection {
@@ -271,21 +316,27 @@ export interface RuntimeInspection {
         readonly generation?: string;
         readonly error?: unknown;
         readonly blockedBy?: readonly BlockedDiagnostic[];
+        readonly health?: 'unknown' | 'healthy' | 'unhealthy';
+        readonly quarantined?: boolean;
+        readonly lazy?: boolean;
+        readonly pinnedGeneration?: string;
         readonly diagnostics?: readonly DiagnosticInput[];
     }[];
 }
 
-// @public
+// @public (undocumented)
 export type RuntimeListener = (event: {
     readonly type: 'installed' | 'started' | 'stopped' | 'replaced' | 'failed' | 'disposed';
     readonly pluginId?: string | undefined;
     readonly generation?: string | undefined;
     readonly cascade?: readonly string[] | undefined;
     readonly error?: unknown;
+    readonly stage?: FailedStage | undefined;
 }) => void;
 
 // @public
 export interface RuntimeOptions {
+    readonly onUnhealthy?: 'quarantine' | 'rollback' | 'fail' | undefined;
     // (undocumented)
     readonly providers?: readonly {
         readonly capability: Capability<unknown>;
@@ -307,13 +358,38 @@ export interface Scope {
 
 // @public
 export interface StartOptions {
+    readonly signal?: AbortSignal | undefined;
     readonly timeoutMs?: number | undefined;
+}
+
+// @public
+export interface StartPlan {
+    // (undocumented)
+    readonly order: readonly string[];
+    // (undocumented)
+    readonly selections: readonly {
+        readonly consumer: string;
+        readonly capabilityId: string;
+        readonly range: string;
+        readonly optional: boolean;
+        readonly providers: readonly {
+            readonly pluginId: string | null;
+            readonly version: string;
+        }[];
+    }[];
 }
 
 // @public
 export interface StopOptions {
     readonly cascade?: boolean | undefined;
+    readonly signal?: AbortSignal | undefined;
     readonly timeoutMs?: number | undefined;
+}
+
+// @public
+export interface StopPlan {
+    // (undocumented)
+    readonly stopped: readonly string[];
 }
 
 // @public
@@ -322,6 +398,26 @@ export interface TimeoutOptions {
     readonly drainMs?: number | undefined;
     readonly healthMs?: number | undefined;
     readonly setupMs?: number | undefined;
+}
+
+// @public
+export interface TransitionRecord {
+    readonly at: number;
+    readonly error?: unknown;
+    // (undocumented)
+    readonly generation?: string | undefined;
+    // (undocumented)
+    readonly pluginId?: string | undefined;
+    readonly seq: number;
+    readonly stage?: FailedStage | undefined;
+    // (undocumented)
+    readonly type: 'installed' | 'started' | 'stopped' | 'replaced' | 'failed' | 'disposed' | 'pinned' | 'quarantined' | 'unquarantined';
+}
+
+// @public
+export interface UninstallOptions {
+    readonly signal?: AbortSignal | undefined;
+    readonly timeoutMs?: number | undefined;
 }
 
 // (No @packageDocumentation comment for this package)

@@ -29,7 +29,7 @@
       "name": "adapters-depend-on-core-only",
       "severity": "error",
       "comment": "Adapters depend on core; core never depends on an adapter, and adapters never import each other.",
-      "from": { "path": "^packages/(test|events|react|vite)/src/" },
+      "from": { "path": "^packages/(test|events|react|vite|verify|devtools)/src/" },
       "to": {
         "path": "^packages/",
         "pathNot": "^packages/runtime-core/"

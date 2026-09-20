@@ -1,0 +1,66 @@
+{
+  "bugs": {
+    "url": "https://github.com/neryva-lab/moult/issues"
+  },
+  "dependencies": {
+    "semver": "^7.8.5"
+  },
+  "description": "Static contract linter for Moult plugin definitions and plugin graphs.",
+  "devDependencies": {
+    "@microsoft/api-extractor": "^7.59.0",
+    "@types/semver": "^7.8.0",
+    "tsdown": "^0.22.14"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "CONTRACT.md",
+    "LICENSE"
+  ],
+  "homepage": "https://github.com/neryva-lab/moult#readme",
+  "keywords": [
+    "moult",
+    "plugin-runtime",
+    "static-analysis",
+    "lint",
+    "contract"
+  ],
+  "license": "MIT",
+  "main": "./dist/index.cjs",
+  "name": "@moult/verify",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "directory": "packages/verify",
+    "type": "git",
+    "url": "git+https://github.com/neryva-lab/moult.git"
+  },
+  "scripts": {
+    "api-extract": "api-extractor run --local",
+    "build": "tsdown",
+    "lint": "eslint . && prettier --check .",
+    "test": "vitest run --config vitest.config.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "sideEffects": false,
+  "type": "module",
+  "types": "./dist/index.d.ts",
+  "version": "0.1.1"
+}

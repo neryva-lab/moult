@@ -4,7 +4,7 @@
  */
 
 import type { PluginDefinition, Runtime } from '@moult/runtime';
-import { MoltError } from '@moult/runtime';
+import { isMoltError, MoltError } from '@moult/runtime';
 
 /** The three module lifecycle events understood by the bridge. @public */
 export type VitePluginEvent = 'added' | 'changed' | 'removed';
@@ -65,7 +65,7 @@ function loadRequired(update: VitePluginUpdate): Promise<PluginDefinition> {
 }
 
 function bridgeError(error: unknown, pluginId: string): MoltError {
-  if (error instanceof MoltError && error.code === 'REPLACEMENT_FAILED') return error;
+  if (isMoltError(error) && error.code === 'REPLACEMENT_FAILED') return error;
   return new MoltError(
     {
       code: 'REPLACEMENT_FAILED',
@@ -93,7 +93,7 @@ export function createViteBridge(options: ViteBridgeOptions): ViteBridge {
   ];
 
   const report = (error: unknown, pluginId: string): void => {
-    const structured = error instanceof MoltError ? error : bridgeError(error, pluginId);
+    const structured = isMoltError(error) ? error : bridgeError(error, pluginId);
     if (diagnose === undefined) return;
     try {
       diagnose(
@@ -129,6 +129,23 @@ export function createViteBridge(options: ViteBridgeOptions): ViteBridge {
 
   async function handleRemoved(update: VitePluginUpdate): Promise<void> {
     try {
+      try {
+        await runtime.stop(update.pluginId);
+      } catch (error) {
+        // `stop` is a no-op on an already-stopped plugin, but an installed
+        // plugin that was never started reports INVALID_STATE/not-active —
+        // it still needs uninstalling, so fall through to it. Anything else
+        // (never installed, active dependents blocking the stop) is a
+        // genuine failure: rethrow so the outer handler preserves its code
+        // through the report/bridgeError path.
+        const neverStarted =
+          isMoltError(error) &&
+          error.code === 'INVALID_STATE' &&
+          error.details?.reason === 'not-active';
+        if (!neverStarted) {
+          throw error;
+        }
+      }
       await runtime.uninstall(update.pluginId);
     } catch (error) {
       const structured = bridgeError(error, update.pluginId);

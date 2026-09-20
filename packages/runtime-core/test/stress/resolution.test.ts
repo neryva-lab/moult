@@ -1,5 +1,7 @@
 // Resolution budget stress: 1,000+ definitions resolve within a
-// loose ceiling — the resolver is O(V+E) and a quadratic regression trips
+// loose ceiling — the graph walk (worklist closure + Kahn order) is O(V+E),
+// plus a per-requirement sort over that capability's candidate providers
+// (O(C log C) for C candidates). A quadratic regression in the walk trips
 // this. The plan construction is measured directly on the resolver (it is a
 // pure function), and the resolved graph is then activated end-to-end to
 // prove the plan is executable, not merely fast. Deterministic construction: a
