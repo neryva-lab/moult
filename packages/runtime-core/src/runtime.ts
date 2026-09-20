@@ -89,6 +89,19 @@ export interface RuntimeInspection {
     readonly message: string;
     readonly cause: unknown;
   }[];
+  /**
+   * Superseded or runtime-released pinned generations that are still
+   * alive because external `retainPin()` holders have not released them.
+   * Each entry names the plugin, the retained generation, and its live
+   * retainer count; the generation is disposed when the count reaches
+   * zero. A host that never releases its retainers leaks the scope —
+   * this list is the diagnostic for that.
+   */
+  readonly retainedPins: readonly {
+    readonly pluginId: string;
+    readonly generation: string;
+    readonly retainers: number;
+  }[];
 }
 
 /**
@@ -113,7 +126,8 @@ export interface RuntimeInspection {
 export type FailedStage = 'resolve' | 'validate' | 'config' | 'setup' | 'prepare' | 'health';
 
 export type RuntimeListener = (event: {
-  readonly type: 'installed' | 'started' | 'stopped' | 'replaced' | 'failed' | 'disposed';
+  readonly type:
+    'installed' | 'started' | 'stopped' | 'replaced' | 'rolledback' | 'failed' | 'disposed';
   readonly pluginId?: string | undefined;
   readonly generation?: string | undefined;
   readonly cascade?: readonly string[] | undefined;
@@ -287,8 +301,15 @@ export interface ReplaceOptions {
    *   uninstalled, or when the runtime is disposed. A new pin supersedes
    *   the previous one.
    *
-   * Note: true holder refcounting would require handle-based capabilities;
-   * with direct values the host owns the release decision.
+   * Holder refcounting: `retainPin(id)` increments the pinned
+   * generation's retainer count and returns a release function. A pin
+   * with live retainers is never disposed by a superseding pin, `stop()`,
+   * `uninstall()`, or anything short of runtime disposal — it survives in
+   * the retained set (visible in `inspect().retainedPins`) until the last
+   * release, which disposes it with a `stopped` event. With direct
+   * capability values the runtime cannot observe holders itself, so the
+   * host owns the retain/release decision; an unreleased retainer leaks
+   * the scope by design.
    */
   readonly inFlight?: 'drain' | 'immediate' | 'pin' | undefined;
 }
@@ -334,9 +355,26 @@ export interface Runtime {
    * replacement, via the normal replacement pipeline (dependents rebind,
    * `migrate` runs, the health gate applies). Fails with `INVALID_STATE`
    * when there is no replacement history. History is bounded — only the
-   * most recent replacements are retained.
+   * most recent replacements are retained. On success, observers receive
+   * the pipeline's `replaced` events followed by a dedicated `rolledback`
+   * event naming the restored generation.
    */
   rollback(id: string): Promise<void>;
+  /**
+   * Retains the plugin's currently pinned generation (kept alive by a
+   * replace with `inFlight: 'pin'`), extending its lifetime past the
+   * runtime's own release. Returns a release function: each call
+   * increments the generation's retainer count and each release
+   * decrements it. The scope is disposed — with a `stopped` event — once
+   * the runtime has released its own hold (a superseding pin, `stop()`,
+   * `uninstall()`, or runtime disposal) *and* the last retainer has
+   * released; releasing while the pin is still the plugin's current pin
+   * simply drops the holder's claim and changes nothing else. Only
+   * runtime disposal force-releases live retainers. Releasing twice is a
+   * no-op. Throws `INVALID_STATE` when the plugin has no pinned
+   * generation.
+   */
+  retainPin(id: string): () => Promise<void>;
   /**
    * Runs the active generation's `healthCheck` hook now and returns its
    * result. The result is recorded on the generation, and an unhealthy
@@ -613,6 +651,20 @@ type RebindOverlay = Map<
   Map<string, { capability: Capability<unknown>; value: unknown; generationId: string }>
 >;
 
+/**
+ * A pinned generation plus its external retainer count. Pins are created
+ * by `replace(..., { inFlight: 'pin' })`; `retainers` counts only
+ * `retainPin()` holders — the runtime itself never holds a retainer, so a
+ * pin with zero retainers is disposed as soon as the runtime releases it
+ * (supersession, stop, uninstall, dispose). A pin with live retainers
+ * survives the runtime's release and is disposed when the last retainer
+ * releases, with a `stopped` event.
+ */
+interface PinState {
+  generation: Generation;
+  retainers: number;
+}
+
 interface PluginRecord {
   definition: PluginDefinition;
   status: PluginStatus;
@@ -641,10 +693,10 @@ interface PluginRecord {
 /**
  * One entry in the runtime's bounded transition audit log (`transitions()`).
  * Every lifecycle transition the runtime performs is recorded here in
- * order: installs, starts, stops, replacements, failures, disposal, and
- * the quarantine/pin transitions that have no subscriber event of their
- * own. The log is a ring buffer — the oldest entries are evicted beyond
- * the capacity bound.
+ * order: installs, starts, stops, replacements, rollbacks, failures,
+ * disposal, and the quarantine/pin transitions that have no subscriber
+ * event of their own. The log is a ring buffer — the oldest entries are
+ * evicted beyond the capacity bound.
  *
  * @public
  */
@@ -658,6 +710,7 @@ export interface TransitionRecord {
     | 'started'
     | 'stopped'
     | 'replaced'
+    | 'rolledback'
     | 'failed'
     | 'disposed'
     | 'pinned'
@@ -672,7 +725,8 @@ export interface TransitionRecord {
 }
 
 interface RuntimeEvent {
-  readonly type: 'installed' | 'started' | 'stopped' | 'replaced' | 'failed' | 'disposed';
+  readonly type:
+    'installed' | 'started' | 'stopped' | 'replaced' | 'rolledback' | 'failed' | 'disposed';
   readonly pluginId?: string | undefined;
   readonly generation?: string | undefined;
   readonly cascade?: readonly string[] | undefined;
@@ -872,9 +926,18 @@ class RuntimeImpl implements Runtime {
   /**
    * Pinned generations: plugin id → the retired generation kept alive by
    * the most recent `inFlight: 'pin'` replace. At most one per plugin;
-   * withdrawn from provider selection, scope alive.
+   * withdrawn from provider selection, scope alive. `retainers` counts
+   * external `retainPin()` holders; the runtime itself never holds a
+   * retainer.
    */
-  readonly #pinned = new Map<string, Generation>();
+  readonly #pins = new Map<string, PinState>();
+  /**
+   * Superseded or runtime-released pins that still have live retainers.
+   * They are out of the pin slot but their scopes stay alive until the
+   * last retainer releases; the release then disposes them. Emptied by
+   * force at runtime disposal.
+   */
+  readonly #retained = new Set<PinState>();
   /** Bounded audit log of lifecycle transitions, oldest first. */
   readonly #transitions: TransitionRecord[] = [];
   #transitionSeq = 0;
@@ -1129,10 +1192,58 @@ class RuntimeImpl implements Runtime {
     // rebind, migrate runs, the health gate applies). The history entry is
     // popped only on success — a failed rollback leaves history untouched.
     // A rollback is an undo, not a new replacement, so success pops rather
-    // than pushing.
-    return this.#enqueue(id, () =>
-      this.#replace(previous, undefined, this.#resolveTimeouts(undefined), true),
-    );
+    // than pushing. The pipeline's `replaced` events still fire (a
+    // generation was committed); a dedicated `rolledback` event marks the
+    // undo for observers that distinguish the two.
+    return this.#enqueue(id, async () => {
+      await this.#replace(previous, undefined, this.#resolveTimeouts(undefined), true);
+      this.#emitRolledBack(id);
+    });
+  }
+
+  /**
+   * Emits the dedicated `rolledback` event after a rollback commits. The
+   * generation is read after the replacement pipeline finishes, so the
+   * event names the restored generation.
+   */
+  #emitRolledBack(id: string): void {
+    this.#emit({
+      type: 'rolledback',
+      pluginId: id,
+      generation: this.#plugins.get(id)?.generation?.id,
+    });
+  }
+
+  retainPin(id: string): () => Promise<void> {
+    this.#assertUsable();
+    const pin = this.#pins.get(id);
+    if (pin === undefined) {
+      throw new MoltError({
+        code: 'INVALID_STATE',
+        message: `plugin ${id} has no pinned generation to retain`,
+        pluginId: id,
+        details: { reason: 'not-pinned' },
+      });
+    }
+    pin.retainers += 1;
+    let released = false;
+    return async () => {
+      if (released) {
+        return; // idempotent: a double release never corrupts the count.
+      }
+      released = true;
+      pin.retainers -= 1;
+      if (pin.retainers > 0) {
+        return;
+      }
+      // This release ends the generation's life only if it already left
+      // the runtime's care (superseded or released while retained). While
+      // it is still the slot pin — or was force-disposed at runtime
+      // teardown — the runtime owns its remaining lifetime.
+      if (this.#retained.delete(pin)) {
+        await this.#disposePin(pin, this.#defaultTimeouts.disposeMs);
+      }
+    };
   }
 
   checkHealth(id: string): Promise<HealthStatus> {
@@ -1185,6 +1296,7 @@ class RuntimeImpl implements Runtime {
       } else if (this.#onUnhealthy === 'rollback') {
         const previous = this.#previousDefinition(id);
         await this.#replace(previous, undefined, this.#resolveTimeouts(undefined), true);
+        this.#emitRolledBack(id);
       }
       return status;
     });
@@ -1196,7 +1308,7 @@ class RuntimeImpl implements Runtime {
 
   inspect(): RuntimeInspection {
     const plugins = [...this.#plugins.values()].map((record) => {
-      const pinned = this.#pinned.get(record.definition.id);
+      const pin = this.#pins.get(record.definition.id);
       return {
         id: record.definition.id,
         status: record.status,
@@ -1207,7 +1319,7 @@ class RuntimeImpl implements Runtime {
         health: record.generation?.health,
         quarantined: record.generation?.quarantined,
         lazy: record.lazy === true && record.generation === undefined,
-        pinnedGeneration: pinned?.id,
+        pinnedGeneration: pin?.generation.id,
       };
     });
     const capabilities: { id: string; provider: string; version: string }[] = [];
@@ -1231,6 +1343,13 @@ class RuntimeImpl implements Runtime {
       plugins,
       capabilities,
       observerDiagnostics: this.#observerDiagnostics.entries(),
+      retainedPins: [...this.#retained].map((pin) =>
+        Object.freeze({
+          pluginId: pin.generation.pluginId,
+          generation: pin.generation.id,
+          retainers: pin.retainers,
+        }),
+      ),
     });
   }
 
@@ -1241,8 +1360,11 @@ class RuntimeImpl implements Runtime {
   validate(): readonly GraphIssue[] {
     const issues: GraphIssue[] = [];
     const pinnedIds = new Set<string>();
-    for (const generation of this.#pinned.values()) {
-      pinnedIds.add(generation.id);
+    for (const pin of this.#pins.values()) {
+      pinnedIds.add(pin.generation.id);
+    }
+    for (const pin of this.#retained) {
+      pinnedIds.add(pin.generation.id);
     }
     // Every published binding must point at a live generation: active or
     // pinned. Anything else is a leak in withdrawal bookkeeping.
@@ -1587,8 +1709,14 @@ class RuntimeImpl implements Runtime {
         }
         this.#withdraw(generation);
       }
-      for (const pluginId of [...this.#pinned.keys()]) {
+      for (const pluginId of [...this.#pins.keys()]) {
         await this.#releasePin(pluginId, disposeMs);
+      }
+      // Retained pins are force-released at runtime disposal: no operation
+      // will ever run again, so no retainer can be awaited. Release
+      // callbacks captured earlier become no-ops.
+      for (const pin of [...this.#retained]) {
+        await this.#disposePin(pin, disposeMs);
       }
       this.#emit({ type: 'disposed' });
     };
@@ -3901,39 +4029,78 @@ class RuntimeImpl implements Runtime {
   /**
    * Pin a retired generation: withdrawn from provider selection (already
    * done at commit), scope kept alive for existing external holders. At
-   * most one pin per plugin — a previous pin is disposed first. Emits
-   * `stopped` for the superseded pin, if any.
+   * most one pin per plugin — a previous pin is disposed first, unless it
+   * has live retainers, in which case it survives in the retained set
+   * until the last retainer releases. Emits `stopped` for a disposed
+   * superseded pin.
    */
   async #pinGeneration(generation: Generation, disposeMs: number | undefined): Promise<void> {
-    const previous = this.#pinned.get(generation.pluginId);
-    if (previous !== undefined && previous !== generation) {
+    const previous = this.#pins.get(generation.pluginId);
+    if (previous !== undefined && previous.generation !== generation) {
       await this.#releasePin(generation.pluginId, disposeMs);
     }
+    if (this.#pins.get(generation.pluginId)?.generation === generation) {
+      return; // already pinned (defensive); keeps the retainer count.
+    }
     generation.pinned = true;
-    this.#pinned.set(generation.pluginId, generation);
+    this.#pins.set(generation.pluginId, { generation, retainers: 0 });
     this.#logTransition('pinned', generation.pluginId, generation.id);
   }
 
   /**
-   * Release a plugin's pinned generation, if any: dispose its scope
-   * (bounded) and emit `stopped`. Disposal errors are recorded on the
-   * plugin's record like any post-commit disposal failure.
+   * Release a plugin's pinned generation, if any: when no external
+   * retainer holds it, dispose its scope (bounded) and emit `stopped`;
+   * with live retainers it leaves the pin slot and survives in the
+   * retained set until the last release. Disposal errors are recorded on
+   * the plugin's record like any post-commit disposal failure.
    */
   async #releasePin(pluginId: string, disposeMs: number | undefined): Promise<void> {
-    const pinned = this.#pinned.get(pluginId);
-    if (pinned === undefined) {
+    const pin = this.#pins.get(pluginId);
+    if (pin === undefined) {
       return;
     }
-    this.#pinned.delete(pluginId);
-    pinned.pinned = false;
-    const report = await this.#disposeBounded(pinned.scope, pinned.pluginId, pinned.id, disposeMs);
+    this.#pins.delete(pluginId);
+    if (pin.retainers > 0) {
+      // External holders keep the generation alive past the runtime's own
+      // release; the last release disposes it.
+      this.#retained.add(pin);
+      return;
+    }
+    await this.#disposePin(pin, disposeMs);
+  }
+
+  /**
+   * Dispose a pin that has left the runtime's care: clears the pinned
+   * flag, disposes the scope (bounded), and emits `stopped`. When the
+   * plugin itself is already gone (stop/uninstall/dispose released the pin
+   * while retainers were live), disposal failures surface through the
+   * bounded observer diagnostics rather than being dropped silently.
+   */
+  async #disposePin(pin: PinState, disposeMs: number | undefined): Promise<void> {
+    this.#retained.delete(pin);
+    const generation = pin.generation;
+    generation.pinned = false;
+    const report = await this.#disposeBounded(
+      generation.scope,
+      generation.pluginId,
+      generation.id,
+      disposeMs,
+    );
     if (report.errors.length > 0) {
-      const record = this.#plugins.get(pluginId);
+      const record = this.#plugins.get(generation.pluginId);
       if (record !== undefined) {
-        record.error = this.#disposalFailure(pinned, report);
+        record.error = this.#disposalFailure(generation, report);
+      } else {
+        this.#observerDiagnostics.push(
+          Object.freeze({
+            message: `disposal of retained pinned generation ${generation.id} failed`,
+            cause:
+              report.errors.length === 1 ? report.errors[0] : Object.freeze([...report.errors]),
+          }),
+        );
       }
     }
-    this.#emit({ type: 'stopped', pluginId: pinned.pluginId, generation: pinned.id });
+    this.#emit({ type: 'stopped', pluginId: generation.pluginId, generation: generation.id });
   }
 
   /**

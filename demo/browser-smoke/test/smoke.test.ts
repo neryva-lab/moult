@@ -21,13 +21,25 @@ test.describe('browser smoke (INV-06/07)', () => {
       join(root, 'packages', 'runtime-core', 'dist', 'index.js'),
       'utf8',
     );
-    const browserRuntimeSource = runtimeSource.replace('from "semver"', 'from "/semver.js"');
+    const browserRuntimeSource = runtimeSource
+      .replace('from "semver"', 'from "/semver.js"')
+      .replace('from "node:async_hooks"', 'from "/async_hooks.js"');
     if (browserRuntimeSource === runtimeSource) {
       throw new Error('browser smoke could not locate the runtime semver import');
     }
     const semverSource = `export const valid = (value) => /^\\d+\\.\\d+\\.\\d+$/.test(value) ? value : null;
       export const validRange = (value) => typeof value === 'string' && value.length > 0 ? value : null;
       export const satisfies = () => true;`;
+    // Minimal AsyncLocalStorage for the smoke test: the smoke setups run
+    // synchronously inside run(), so a stack discipline is faithful.
+    const asyncHooksSource = `export class AsyncLocalStorage {
+      #stack = [];
+      getStore() { return this.#stack.length > 0 ? this.#stack[this.#stack.length - 1] : undefined; }
+      run(store, fn, ...args) {
+        this.#stack.push(store);
+        try { return fn(...args); } finally { this.#stack.pop(); }
+      }
+    }`;
     const html = `<!doctype html><html><body><output id="result"></output><script type="module">
       import { capability, contributionKey, createRuntime } from '/runtime.js';
       const token = capability('browser.smoke.value', '1.0.0');
@@ -58,6 +70,16 @@ test.describe('browser smoke (INV-06/07)', () => {
       if (request.url === '/semver.js') {
         response.writeHead(200, { 'content-type': 'text/javascript' });
         response.end(semverSource);
+        return;
+      }
+      if (request.url === '/async_hooks.js') {
+        response.writeHead(200, { 'content-type': 'text/javascript' });
+        response.end(asyncHooksSource);
+        return;
+      }
+      if (request.url === '/async_hooks.js') {
+        response.writeHead(200, { 'content-type': 'text/javascript' });
+        response.end(asyncHooksSource);
         return;
       }
       response.writeHead(200, { 'content-type': 'text/html' });

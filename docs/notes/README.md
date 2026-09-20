@@ -24,7 +24,8 @@ implementation.
 7. [Implementation roadmap](./07-implementation-roadmap.md) — an intentionally staged build plan with stop conditions.
 8. [Positioning and related work](./08-positioning-and-related-work.md) — existing systems, the unoccupied claim, and the naming record.
 9. [Packages and distribution](./09-packages-and-distribution.md) — publishable set, TanStack/Effect-style scoped distribution, install patterns, and how to add a new adapter.
-10. [Public guarantees](../guarantees.md) — the INV-01…INV-15 guarantee registry in a concise public form.
+10. [Versioning policy](./10-versioning-policy.md) — how plugin authors version plugins and capabilities, what counts as breaking, and how ranges resolve.
+11. [Public guarantees](../guarantees.md) — the INV-01…INV-15 guarantee registry in a concise public form.
 
 The executable engineering plan and release ledger are maintainer-only
 materials and are not part of the published repository. The public contract is

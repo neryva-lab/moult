@@ -455,6 +455,65 @@ describe('public rollback', () => {
   });
 });
 
+describe('rolledback event', () => {
+  it('emits rolledback to subscribers with the restored generation', async () => {
+    const runtime = createRuntime();
+    const events: { type: string; pluginId?: string; generation?: string }[] = [];
+    runtime.subscribe((event) => {
+      events.push({
+        type: event.type,
+        ...(event.pluginId !== undefined ? { pluginId: event.pluginId } : {}),
+        ...(event.generation !== undefined ? { generation: event.generation } : {}),
+      });
+    });
+    runtime.install({ id: 'test.rbevent', version: '1.0.0', setup: () => {} });
+    await runtime.start('test.rbevent');
+    await runtime.replace({ id: 'test.rbevent', version: '2.0.0', setup: () => {} });
+    events.length = 0;
+
+    await runtime.rollback('test.rbevent');
+    const rolledback = events.filter((event) => event.type === 'rolledback');
+    expect(rolledback).toHaveLength(1);
+    expect(rolledback[0]?.pluginId).toBe('test.rbevent');
+    const restoredGeneration = runtime
+      .inspect()
+      .plugins.find((p) => p.id === 'test.rbevent')?.generation;
+    expect(rolledback[0]?.generation).toBe(restoredGeneration);
+    // The pipeline's replaced event still fires first: observers that only
+    // track replaced keep working.
+    expect(events.map((event) => event.type)).toEqual(['replaced', 'rolledback']);
+    await runtime.dispose();
+  });
+
+  it('a health-policy rollback also emits rolledback', async () => {
+    const runtime = createRuntime({ onUnhealthy: 'rollback' });
+    const events: string[] = [];
+    runtime.subscribe((event) => {
+      events.push(event.type);
+    });
+    let failProbe = false;
+    runtime.install({
+      id: 'test.rbpolicy',
+      version: '1.0.0',
+      setup: () => {},
+      // v1 stays healthy so the policy rollback can commit.
+      healthCheck: () => ({ ok: true }),
+    });
+    await runtime.start('test.rbpolicy');
+    await runtime.replace({
+      id: 'test.rbpolicy',
+      version: '2.0.0',
+      setup: () => {},
+      healthCheck: () => ({ ok: !failProbe }),
+    });
+    failProbe = true;
+    events.length = 0;
+    await runtime.checkHealth('test.rbpolicy');
+    expect(events).toContain('rolledback');
+    await runtime.dispose();
+  });
+});
+
 describe('caller abort signals', () => {
   function abortedSignal(): AbortSignal {
     const controller = new AbortController();
@@ -2123,8 +2182,228 @@ describe('pin audit', () => {
   });
 });
 
+describe('pin refcounting', () => {
+  it('throws INVALID_STATE when there is no pinned generation to retain', async () => {
+    const runtime = createRuntime();
+    runtime.install({ id: 'test.nopin', version: '1.0.0', setup: () => {} });
+    await runtime.start('test.nopin');
+    let error: unknown;
+    try {
+      runtime.retainPin('test.nopin');
+    } catch (e) {
+      error = e;
+    }
+    expectCode(error, 'INVALID_STATE');
+    if (isMoltError(error)) {
+      expect(error.details).toMatchObject({ reason: 'not-pinned' });
+    }
+    await runtime.dispose();
+  });
+
+  it('a superseding pin keeps a retained generation alive until the last release', async () => {
+    const runtime = createRuntime();
+    const disposed: string[] = [];
+    const events: { type: string; generation?: string }[] = [];
+    runtime.subscribe((event) => {
+      events.push({
+        type: event.type,
+        ...(event.generation !== undefined ? { generation: event.generation } : {}),
+      });
+    });
+    const id = 'test.retain';
+    runtime.install({
+      id,
+      version: '1.0.0',
+      setup: (ctx) => {
+        ctx.scope.onDispose(() => {
+          disposed.push('1.0.0');
+        });
+      },
+    });
+    await runtime.start(id);
+    await runtime.replace(
+      {
+        id,
+        version: '2.0.0',
+        setup: (ctx) => {
+          ctx.scope.onDispose(() => {
+            disposed.push('2.0.0');
+          });
+        },
+      },
+      { inFlight: 'pin' },
+    );
+    const pinnedV1 = runtime.inspect().plugins.find((p) => p.id === id)?.pinnedGeneration;
+    expect(pinnedV1).toBeDefined();
+
+    const release = runtime.retainPin(id);
+    // A second replace supersedes the pin: v1's generation leaves the pin
+    // slot but stays alive for the retainer; v2's generation is pinned.
+    await runtime.replace({ id, version: '3.0.0', setup: () => {} }, { inFlight: 'pin' });
+    expect(disposed).toEqual([]);
+    const slot = runtime.inspect().plugins.find((p) => p.id === id)?.pinnedGeneration;
+    expect(slot).toBeDefined();
+    expect(slot).not.toBe(pinnedV1);
+    const retained = runtime.inspect().retainedPins;
+    expect(retained).toHaveLength(1);
+    expect(retained[0]).toMatchObject({ pluginId: id, generation: pinnedV1, retainers: 1 });
+
+    await release();
+    expect(disposed).toEqual(['1.0.0']);
+    expect(runtime.inspect().retainedPins).toEqual([]);
+    const stoppedForV1 = events.filter(
+      (event) => event.type === 'stopped' && event.generation === pinnedV1,
+    );
+    expect(stoppedForV1).toHaveLength(1);
+    await runtime.dispose();
+  });
+
+  it('releasing the slot pin drops the claim without disposing early', async () => {
+    const runtime = createRuntime();
+    const disposed: string[] = [];
+    const id = 'test.retainslot';
+    runtime.install({
+      id,
+      version: '1.0.0',
+      setup: (ctx) => {
+        ctx.scope.onDispose(() => {
+          disposed.push('1.0.0');
+        });
+      },
+    });
+    await runtime.start(id);
+    await runtime.replace({ id, version: '2.0.0', setup: () => {} }, { inFlight: 'pin' });
+    const pinned = runtime.inspect().plugins.find((p) => p.id === id)?.pinnedGeneration;
+    expect(pinned).toBeDefined();
+
+    const release = runtime.retainPin(id);
+    await release();
+    // The runtime still holds its own pin: nothing is disposed early.
+    expect(disposed).toEqual([]);
+    expect(runtime.inspect().plugins.find((p) => p.id === id)?.pinnedGeneration).toBe(pinned);
+    // A double release is a no-op, never corrupting the count.
+    await release();
+    expect(disposed).toEqual([]);
+    // The runtime's own release (stop) still disposes the pin.
+    await runtime.stop(id);
+    expect(disposed).toEqual(['1.0.0']);
+    await runtime.dispose();
+  });
+
+  it('stop with a live retainer keeps the pin until release', async () => {
+    const runtime = createRuntime();
+    const disposed: string[] = [];
+    const id = 'test.retainstop';
+    runtime.install({
+      id,
+      version: '1.0.0',
+      setup: (ctx) => {
+        ctx.scope.onDispose(() => {
+          disposed.push('1.0.0');
+        });
+      },
+    });
+    await runtime.start(id);
+    await runtime.replace({ id, version: '2.0.0', setup: () => {} }, { inFlight: 'pin' });
+    const pinned = runtime.inspect().plugins.find((p) => p.id === id)?.pinnedGeneration;
+
+    const release = runtime.retainPin(id);
+    await runtime.stop(id);
+    expect(disposed).toEqual([]);
+    expect(runtime.inspect().retainedPins).toHaveLength(1);
+    expect(runtime.inspect().retainedPins[0]?.generation).toBe(pinned);
+    await release();
+    expect(disposed).toEqual(['1.0.0']);
+    await runtime.dispose();
+  });
+
+  it('uninstall with a live retainer surfaces disposal failures in observer diagnostics', async () => {
+    const runtime = createRuntime();
+    const id = 'test.retainuninstall';
+    runtime.install({
+      id,
+      version: '1.0.0',
+      setup: (ctx) => {
+        ctx.scope.onDispose(() => {
+          throw new Error('v1 disposer blew up');
+        });
+      },
+    });
+    await runtime.start(id);
+    await runtime.replace({ id, version: '2.0.0', setup: () => {} }, { inFlight: 'pin' });
+
+    const release = runtime.retainPin(id);
+    await runtime.stop(id);
+    await runtime.uninstall(id);
+    // The plugin is gone but the retained scope is still alive.
+    expect(runtime.inspect().retainedPins).toHaveLength(1);
+    await release();
+    expect(runtime.inspect().retainedPins).toEqual([]);
+    const diagnostics = runtime.inspect().observerDiagnostics;
+    expect(diagnostics.some((entry) => entry.message.includes('retained pinned generation'))).toBe(
+      true,
+    );
+    await runtime.dispose();
+  });
+
+  it('runtime disposal force-releases retained pins; later releases are no-ops', async () => {
+    const runtime = createRuntime();
+    const disposed: string[] = [];
+    const id = 'test.retaindispose';
+    runtime.install({
+      id,
+      version: '1.0.0',
+      setup: (ctx) => {
+        ctx.scope.onDispose(() => {
+          disposed.push('1.0.0');
+        });
+      },
+    });
+    await runtime.start(id);
+    await runtime.replace({ id, version: '2.0.0', setup: () => {} }, { inFlight: 'pin' });
+    const release = runtime.retainPin(id);
+    await runtime.stop(id);
+    expect(runtime.inspect().retainedPins).toHaveLength(1);
+    await runtime.dispose();
+    expect(disposed).toEqual(['1.0.0']);
+    // The captured release is now a harmless no-op.
+    await release();
+    expect(disposed).toEqual(['1.0.0']);
+  });
+
+  it('multiple retainers require every release before disposal', async () => {
+    const runtime = createRuntime();
+    const disposed: string[] = [];
+    const id = 'test.retainmulti';
+    runtime.install({
+      id,
+      version: '1.0.0',
+      setup: (ctx) => {
+        ctx.scope.onDispose(() => {
+          disposed.push('1.0.0');
+        });
+      },
+    });
+    await runtime.start(id);
+    await runtime.replace({ id, version: '2.0.0', setup: () => {} }, { inFlight: 'pin' });
+    const releaseA = runtime.retainPin(id);
+    const releaseB = runtime.retainPin(id);
+    // Supersede so the runtime releases its own hold; only the two
+    // retainers keep the generation alive now.
+    await runtime.replace({ id, version: '3.0.0', setup: () => {} }, { inFlight: 'pin' });
+    expect(runtime.inspect().retainedPins[0]).toMatchObject({ retainers: 2 });
+    await releaseA();
+    expect(disposed).toEqual([]);
+    expect(runtime.inspect().retainedPins[0]).toMatchObject({ retainers: 1 });
+    await releaseB();
+    expect(disposed).toEqual(['1.0.0']);
+    expect(runtime.inspect().retainedPins).toEqual([]);
+    await runtime.dispose();
+  });
+});
+
 describe('transition audit', () => {
-  it('rollback logs balanced lifecycle transitions, never a false commit', async () => {
+  it('rollback logs a replaced transition plus a dedicated rolledback transition', async () => {
     const runtime = createRuntime();
     runtime.install({ id: 'test.trplugin', version: '1.0.0', setup: () => {} });
     await runtime.start('test.trplugin');
@@ -2132,10 +2411,10 @@ describe('transition audit', () => {
     const before = runtime.transitions().map((entry) => entry.type);
     await runtime.rollback('test.trplugin');
     const after = runtime.transitions().map((entry) => entry.type);
-    // A rollback is an undo through the replacement pipeline: it logs a
-    // single 'replaced' like any replacement — no 'rolledback'
-    // pseudo-transition, no duplicate.
-    expect(after.slice(before.length)).toEqual(['replaced']);
+    // A rollback is an undo through the replacement pipeline: it logs the
+    // pipeline's 'replaced' transition, then a dedicated 'rolledback'
+    // transition marking the undo — no duplicate, no false commit.
+    expect(after.slice(before.length)).toEqual(['replaced', 'rolledback']);
     // Sequence numbers are monotonic with no gaps or repeats.
     const seqs = runtime.transitions().map((entry) => entry.seq);
     for (let i = 1; i < seqs.length; i += 1) {

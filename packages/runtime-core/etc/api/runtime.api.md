@@ -281,6 +281,7 @@ export interface Runtime {
     }): StopPlan;
     // (undocumented)
     replace(definition: PluginDefinition, options?: ReplaceOptions): Promise<void>;
+    retainPin(id: string): () => Promise<void>;
     rollback(id: string): Promise<void>;
     // (undocumented)
     start(id: string, options?: StartOptions): Promise<void>;
@@ -322,11 +323,16 @@ export interface RuntimeInspection {
         readonly pinnedGeneration?: string;
         readonly diagnostics?: readonly DiagnosticInput[];
     }[];
+    readonly retainedPins: readonly {
+        readonly pluginId: string;
+        readonly generation: string;
+        readonly retainers: number;
+    }[];
 }
 
 // @public (undocumented)
 export type RuntimeListener = (event: {
-    readonly type: 'installed' | 'started' | 'stopped' | 'replaced' | 'failed' | 'disposed';
+    readonly type: 'installed' | 'started' | 'stopped' | 'replaced' | 'rolledback' | 'failed' | 'disposed';
     readonly pluginId?: string | undefined;
     readonly generation?: string | undefined;
     readonly cascade?: readonly string[] | undefined;
@@ -411,7 +417,7 @@ export interface TransitionRecord {
     readonly seq: number;
     readonly stage?: FailedStage | undefined;
     // (undocumented)
-    readonly type: 'installed' | 'started' | 'stopped' | 'replaced' | 'failed' | 'disposed' | 'pinned' | 'quarantined' | 'unquarantined';
+    readonly type: 'installed' | 'started' | 'stopped' | 'replaced' | 'rolledback' | 'failed' | 'disposed' | 'pinned' | 'quarantined' | 'unquarantined';
 }
 
 // @public

@@ -25,7 +25,7 @@
     "test:stress": "vitest run --project stress",
     "test:adapters": "pnpm --filter @moult/test test && pnpm --filter @moult/events test && pnpm --filter @moult/react test && pnpm --filter @moult/vite test && pnpm --filter @moult/verify test && pnpm --filter @moult/devtools test && pnpm --filter @moult/example-command-host test && pnpm --filter @moult/example-worker-host test && pnpm --filter @moult/example-integration-demo test",
     "test:browser": "pnpm --filter @moult/browser-smoke test",
-    "check:pkg": "pnpm --filter @moult/runtime --filter @moult/test --filter @moult/events --filter @moult/react --filter @moult/vite --filter @moult/verify && pnpm --filter @moult/devtools exec publint && pnpm --filter @moult/runtime --filter @moult/test --filter @moult/events --filter @moult/react --filter @moult/vite --filter @moult/verify && pnpm --filter @moult/devtools exec attw --pack .",
+    "check:pkg": "pnpm --filter @moult/runtime --filter @moult/test --filter @moult/events --filter @moult/react --filter @moult/vite --filter @moult/verify --filter @moult/devtools exec publint && pnpm --filter @moult/devtools exec attw --pack .",
     "check:arch": "depcruise packages --config .cruiser.json",
     "check:api": "pnpm -r api-extract",
     "bench": "pnpm --filter ./demo/comparison bench",

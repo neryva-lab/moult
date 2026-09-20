@@ -82,6 +82,11 @@ export function buildInspection(input: {
     readonly message: string;
     readonly cause: unknown;
   }[];
+  readonly retainedPins?: readonly {
+    readonly pluginId: string;
+    readonly generation: string;
+    readonly retainers: number;
+  }[];
 }): RuntimeInspection {
   const capabilities = [...input.capabilities].sort((a, b) =>
     a.id < b.id
@@ -121,6 +126,9 @@ export function buildInspection(input: {
     capabilities: Object.freeze(capabilities.map((capability) => Object.freeze({ ...capability }))),
     observerDiagnostics: Object.freeze(
       (input.observerDiagnostics ?? []).map((entry) => Object.freeze({ ...entry })),
+    ),
+    retainedPins: Object.freeze(
+      (input.retainedPins ?? []).map((entry) => Object.freeze({ ...entry })),
     ),
   });
 }

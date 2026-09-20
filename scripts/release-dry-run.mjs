@@ -8,10 +8,10 @@ import { spawnSync } from 'node:child_process';
 const isWindows = process.platform === 'win32';
 const pnpm = isWindows ? 'pnpm.cmd' : 'pnpm';
 
-function run(args) {
+function run(args, options = {}) {
   const command = isWindows ? (process.env.ComSpec ?? 'cmd.exe') : pnpm;
   const commandArgs = isWindows ? ['/d', '/s', '/c', pnpm, ...args] : args;
-  const result = spawnSync(command, commandArgs, { stdio: 'inherit' });
+  const result = spawnSync(command, commandArgs, { stdio: 'inherit', ...options });
   if (result.error !== undefined) {
     throw result.error;
   }
@@ -29,15 +29,16 @@ const packageDirectories = readdirSync('packages')
   .filter((directory) => statSync(directory).isDirectory());
 
 for (const directory of packageDirectories) {
-  run([
-    '--dir',
-    directory,
-    'publish',
-    '--dry-run',
-    '--no-git-checks',
-    '--tag',
-    'dry-run',
-    '--access',
-    'public',
-  ]);
+  run(
+    [
+      'publish',
+      '--dry-run',
+      '--no-git-checks',
+      '--tag',
+      'dry-run',
+      '--access',
+      'public',
+    ],
+    { cwd: directory },
+  );
 }

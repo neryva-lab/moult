@@ -26,7 +26,8 @@ import { satisfiesRange } from '../../src/internal/semver.js';
 import type { World, WorldPlugin } from './generators.js';
 
 export interface ModelEvent {
-  readonly type: 'installed' | 'started' | 'stopped' | 'replaced' | 'failed' | 'disposed';
+  readonly type:
+    'installed' | 'started' | 'stopped' | 'replaced' | 'rolledback' | 'failed' | 'disposed';
   readonly pluginId?: string | undefined;
   readonly generation?: string | undefined;
   readonly cascade?: readonly string[] | undefined;
