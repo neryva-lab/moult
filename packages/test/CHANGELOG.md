@@ -1,5 +1,13 @@
 # @moult/test
 
+## 0.1.2
+
+### Patch Changes
+
+- 343bf9a: Fix the published READMEs: correct the headline example's plugin id so the snippet runs as documented, and remove stale pre-release status claims.
+- Updated dependencies [343bf9a]
+  - @moult/runtime@0.1.2
+
 ## 0.1.1
 
 ### Patch Changes
