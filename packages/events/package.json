@@ -1,6 +1,6 @@
 {
   "name": "@moult/events",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Generation-scoped typed event capability for Moult hosts and plugins.",
   "keywords": [
     "events",
