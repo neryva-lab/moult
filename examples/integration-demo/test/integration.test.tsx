@@ -1221,14 +1221,19 @@ describe('integration-demo (real-app, robust, end-to-end)', () => {
     });
     await rt.start('demo.dependent');
 
-    // INV-15: replace provider with active dependent must be REPLACEMENT_FAILED with details.dependents and path
+    // INV-15 (strict mode): replace provider with active dependent must be
+    // REPLACEMENT_FAILED with details.dependents and path. By default
+    // replace rebinds dependents instead of rejecting.
     await expect(
-      rt.replace({
-        id: 'demo.dep2',
-        version: '1.0.1',
-        provides: [{ capability: storageCapability }],
-        setup: (c) => c.provide(storageCapability, { get: () => 'new', set: () => {} }),
-      }),
+      rt.replace(
+        {
+          id: 'demo.dep2',
+          version: '1.0.1',
+          provides: [{ capability: storageCapability }],
+          setup: (c) => c.provide(storageCapability, { get: () => 'new', set: () => {} }),
+        },
+        { strictDependents: true },
+      ),
     ).rejects.toSatisfy((e: unknown) => {
       if (!isMoltError(e) || e.code !== 'REPLACEMENT_FAILED') return false;
       return (

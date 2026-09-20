@@ -85,7 +85,42 @@ export interface DisposalReport {
 }
 
 // @public
+export interface DrainContext {
+    // (undocumented)
+    readonly generation: string;
+    // (undocumented)
+    readonly pluginId: string;
+    // (undocumented)
+    readonly signal: AbortSignal;
+}
+
+// @public
+export interface HealthStatus {
+    // (undocumented)
+    readonly message?: string | undefined;
+    // (undocumented)
+    readonly ok: boolean;
+}
+
+// @public
+export interface InstallOptions {
+    readonly config?: Record<string, unknown> | undefined;
+}
+
+// @public
 export function isMoltError(value: unknown): value is MoltError;
+
+// @public
+export interface MigrationPrevious {
+    // (undocumented)
+    readonly generation: string;
+    // (undocumented)
+    readonly pluginId: string;
+    readonly provided: ReadonlyMap<string, unknown>;
+    readonly stateVersion: string | undefined;
+    // (undocumented)
+    readonly version: string;
+}
 
 // @public
 export class MoltError extends Error {
@@ -118,6 +153,7 @@ export interface MoltErrorInit {
 
 // @public
 export interface PluginContext {
+    readonly config: Readonly<Record<string, unknown>>;
     // (undocumented)
     contribute<T>(key: ContributionKey<T>, value: T): void;
     // (undocumented)
@@ -139,14 +175,20 @@ export interface PluginContext {
 
 // @public
 export interface PluginDefinition {
+    readonly config?: Record<string, unknown> | undefined;
+    readonly drain?: ((context: DrainContext) => void | Promise<void>) | undefined;
+    readonly healthCheck?: ((context: PluginContext) => HealthStatus | Promise<HealthStatus>) | undefined;
     // (undocumented)
     readonly id: string;
+    readonly migrate?: ((previous: MigrationPrevious, context: PluginContext) => void | Promise<void>) | undefined;
     // (undocumented)
     readonly provides?: readonly ProvidedCapability[] | undefined;
     // (undocumented)
     readonly requires?: readonly Requirement[] | undefined;
     // (undocumented)
     readonly setup: (context: PluginContext) => void | DisposableLike | Promise<void | DisposableLike>;
+    readonly stateVersion?: string | undefined;
+    readonly validateConfig?: ((config: Readonly<Record<string, unknown>>) => readonly string[]) | undefined;
     // (undocumented)
     readonly version: string;
 }
@@ -163,6 +205,12 @@ export interface ProvidedCapability {
 }
 
 // @public
+export interface ReplaceOptions {
+    readonly strictDependents?: boolean | undefined;
+    readonly timeoutMs?: number | undefined;
+}
+
+// @public
 export interface Requirement {
     // (undocumented)
     readonly capability: Capability<unknown>;
@@ -174,32 +222,35 @@ export interface Requirement {
 
 // @public
 export interface Runtime {
+    checkHealth(id: string): Promise<HealthStatus>;
     // (undocumented)
     contributions(): ContributionSnapshot;
     // (undocumented)
-    dispose(): Promise<void>;
+    dispose(options?: {
+        readonly timeoutMs?: number | undefined;
+    }): Promise<void>;
     // (undocumented)
     getStatus(id: string): PluginStatus | undefined;
     // (undocumented)
     inspect(): RuntimeInspection;
     // (undocumented)
-    install(definition: PluginDefinition): void;
+    install(definition: PluginDefinition, options?: InstallOptions): void;
     // (undocumented)
-    replace(definition: PluginDefinition): Promise<void>;
+    replace(definition: PluginDefinition, options?: ReplaceOptions): Promise<void>;
+    rollback(id: string): Promise<void>;
     // (undocumented)
-    start(id: string): Promise<void>;
+    start(id: string, options?: StartOptions): Promise<void>;
     // (undocumented)
-    stop(id: string, options?: {
-        readonly cascade?: boolean;
-    }): Promise<void>;
+    stop(id: string, options?: StopOptions): Promise<void>;
     // (undocumented)
     subscribe(listener: RuntimeListener): () => void;
     // (undocumented)
     uninstall(id: string): Promise<void>;
+    updateConfig(id: string, patch: Record<string, unknown>): void;
 }
 
 // @public
-export type RuntimeErrorCode = 'DUPLICATE_PLUGIN' | 'INVALID_DEFINITION' | 'MISSING_CAPABILITY' | 'INCOMPATIBLE_CAPABILITY' | 'AMBIGUOUS_PROVIDER' | 'DEPENDENCY_CYCLE' | 'ACTIVE_DEPENDENTS' | 'ACTIVATION_FAILED' | 'DISPOSAL_FAILED' | 'REPLACEMENT_FAILED' | 'INVALID_STATE';
+export type RuntimeErrorCode = 'DUPLICATE_PLUGIN' | 'INVALID_DEFINITION' | 'MISSING_CAPABILITY' | 'INCOMPATIBLE_CAPABILITY' | 'AMBIGUOUS_PROVIDER' | 'DEPENDENCY_CYCLE' | 'ACTIVE_DEPENDENTS' | 'ACTIVATION_FAILED' | 'DISPOSAL_FAILED' | 'REPLACEMENT_FAILED' | 'SETUP_TIMEOUT' | 'DISPOSAL_TIMEOUT' | 'INVALID_STATE';
 
 // @public
 export interface RuntimeInspection {
@@ -240,6 +291,7 @@ export interface RuntimeOptions {
         readonly capability: Capability<unknown>;
         readonly value: unknown;
     }[];
+    readonly timeouts?: TimeoutOptions | undefined;
 }
 
 // @public
@@ -251,6 +303,25 @@ export interface Scope {
     isDisposed(): boolean;
     onDispose(disposer: () => void | Promise<void>): void;
     readonly signal: AbortSignal;
+}
+
+// @public
+export interface StartOptions {
+    readonly timeoutMs?: number | undefined;
+}
+
+// @public
+export interface StopOptions {
+    readonly cascade?: boolean | undefined;
+    readonly timeoutMs?: number | undefined;
+}
+
+// @public
+export interface TimeoutOptions {
+    readonly disposeMs?: number | undefined;
+    readonly drainMs?: number | undefined;
+    readonly healthMs?: number | undefined;
+    readonly setupMs?: number | undefined;
 }
 
 // (No @packageDocumentation comment for this package)

@@ -179,7 +179,7 @@ describe('missing, incompatible, ambiguous, and multi providers', () => {
     ).toEqual([null, 'test.plugin']);
   });
 
-  it('a compatible-but-stopped provider is never selected and shows verdict stopped', () => {
+  it('a stopped provider with no active rival is revived as the fallback (F1 restart)', () => {
     const provider = definition({ id: 'test.provider', provides: [{ capability: storage }] });
     const consumer = definition({
       id: 'test.consumer',
@@ -189,18 +189,56 @@ describe('missing, incompatible, ambiguous, and multi providers', () => {
       ['test.provider', 'stopped'],
       ['test.consumer', 'installed'],
     ]);
+    const plan = resolve({
+      definitions: [provider, consumer],
+      statuses,
+      hostProviders: new Map(),
+      root: 'test.consumer',
+    });
+    // Starting the root is explicit consent to revive its provider closure:
+    // the stopped provider is selected, providers-first, root last.
+    expect(plan.providers.get('test.consumer')?.get('test.storage')?.[0]?.pluginId).toBe(
+      'test.provider',
+    );
+    expect(plan.order).toEqual(['test.provider', 'test.consumer']);
+  });
+
+  it('mixed active/stopped ambiguity reports the stopped rival with verdict stopped', () => {
+    const activeA = definition({ id: 'test.active-a', provides: [{ capability: storage }] });
+    const activeB = definition({ id: 'test.active-b', provides: [{ capability: storage }] });
+    const stopped = definition({ id: 'test.stopped', provides: [{ capability: storage }] });
+    const consumer = definition({
+      id: 'test.consumer',
+      requires: [{ capability: storage, range: '*' }],
+    });
+    const statuses = new Map<string, PluginStatus>([
+      ['test.active-a', 'active'],
+      ['test.active-b', 'active'],
+      ['test.stopped', 'stopped'],
+      ['test.consumer', 'installed'],
+    ]);
     const error = expectCode(
       () =>
         resolve({
-          definitions: [provider, consumer],
+          definitions: [activeA, activeB, stopped, consumer],
           statuses,
           hostProviders: new Map(),
           root: 'test.consumer',
         }),
-      'MISSING_CAPABILITY',
+      'AMBIGUOUS_PROVIDER',
     );
-    const blocked = (error.details?.['blocked'] as { candidates: { verdict: string }[] }[])?.[0];
-    expect(blocked?.candidates[0]?.verdict).toBe('stopped');
+    const candidates = (
+      error.details?.['blocked'] as {
+        candidates: { pluginId: string | null; verdict: string }[];
+      }[]
+    )?.[0]?.candidates;
+    expect(candidates?.find((c) => c.pluginId === 'test.stopped')?.verdict).toBe('stopped');
+    expect(
+      candidates
+        ?.filter((c) => c.verdict === 'ok')
+        .map((c) => c.pluginId)
+        .sort(),
+    ).toEqual(['test.active-a', 'test.active-b']);
   });
 
   it('optional requirement: absent → no edge; incompatible → diagnostic without failure', () => {
@@ -240,15 +278,22 @@ describe('version ranges and host providers', () => {
   it('INV-10: keeps separate selections for consumers with different ranges', () => {
     const v1 = capability('test.shared', '1.0.0');
     const v2 = capability('test.shared', '2.0.0');
+    const helper = capability('test.helper', '1.0.0');
     const providerV1 = definition({ id: 'test.provider-v1', provides: [{ capability: v1 }] });
     const providerV2 = definition({ id: 'test.provider-v2', provides: [{ capability: v2 }] });
-    const consumerV1 = definition({
-      id: 'test.consumer-v1',
-      requires: [{ capability: v1, range: '^1.0.0' }],
-    });
+    // consumerV2 joins the root's closure through the helper capability, so
+    // the fixpoint walks it; a consumer nobody selects is not resolved.
     const consumerV2 = definition({
       id: 'test.consumer-v2',
+      provides: [{ capability: helper }],
       requires: [{ capability: v2, range: '^2.0.0' }],
+    });
+    const consumerV1 = definition({
+      id: 'test.consumer-v1',
+      requires: [
+        { capability: v1, range: '^1.0.0' },
+        { capability: helper, range: '*' },
+      ],
     });
     const definitions = [providerV1, providerV2, consumerV1, consumerV2];
     const plan = resolve({
@@ -526,5 +571,36 @@ describe('reverse edges and defensive checks', () => {
     expect(plan.order).toEqual(['test.standalone']);
     expect(plan.edges).toEqual([]);
     expect(plan.diagnostics).toEqual([]);
+  });
+
+  it('keeps the topological order when one consumer selects the same provider twice', () => {
+    // A consumer whose two requirements select the same (consumer, provider)
+    // pair emits two edges to that provider. The Kahn pass must still wait
+    // for every distinct provider before emitting the consumer.
+    const multiB = capability<{ name: string }>('test.multi2', '1.0.0', { multiple: true });
+    const shared = definition({
+      id: 'test.shared',
+      provides: [{ capability: multi }, { capability: multiB }],
+    });
+    const other = definition({
+      id: 'test.other',
+      provides: [{ capability: multi }, { capability: multiB }],
+    });
+    const fan = definition({
+      id: 'test.fan',
+      requires: [
+        { capability: multi, range: '*' },
+        { capability: multiB, range: '*' },
+      ],
+    });
+    const plan = resolve({
+      definitions: [shared, other, fan],
+      statuses: noStatuses([shared, other, fan]),
+      hostProviders: new Map(),
+      root: 'test.fan',
+    });
+    const position = new Map(plan.order.map((id, index) => [id, index] as const));
+    expect(position.get('test.fan')).toBeGreaterThan(position.get('test.other') ?? -1);
+    expect(position.get('test.fan')).toBeGreaterThan(position.get('test.shared') ?? -1);
   });
 });

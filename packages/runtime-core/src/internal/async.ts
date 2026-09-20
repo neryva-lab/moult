@@ -19,25 +19,6 @@ export function createDeferred<T>(): Deferred<T> {
 }
 
 /**
- * Serializes async sections. Sections run in call order; a failing section
- * never blocks the next one.
- */
-export class AsyncMutex {
-  // The tail never rejects: failures settle into it via the two-callback
-  // assignment below, so `.then(section)` alone is safe.
-  #tail: Promise<void> = Promise.resolve();
-
-  runExclusive<T>(section: () => T | Promise<T>): Promise<T> {
-    const result = this.#tail.then(section);
-    this.#tail = result.then(
-      () => undefined,
-      () => undefined,
-    );
-    return result;
-  }
-}
-
-/**
  * Per-key operation tails (queue-and-wait busy policy): operations for a
  * key run strictly in call order regardless of earlier outcomes, and re-read
  * state when they run because state may have changed while they waited.
@@ -118,5 +99,42 @@ export class BoundedLog<T> {
 
   get size(): number {
     return this.#items.length;
+  }
+}
+
+/**
+ * Races a promise against a timeout. When `ms` is undefined the promise is
+ * awaited directly — no timer is created. On timeout `onTimeout` runs (to
+ * abort a signal, for example) and `makeError`'s error is thrown; the
+ * underlying promise keeps running to its own settlement, which the race
+ * already observes, so a late rejection is never unhandled.
+ */
+export async function withTimeout<T>(
+  promise: Promise<T>,
+  ms: number | undefined,
+  makeError: () => Error,
+  onTimeout?: () => void,
+): Promise<T> {
+  if (ms === undefined) {
+    return promise;
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => {
+          try {
+            onTimeout?.();
+          } finally {
+            reject(makeError());
+          }
+        }, ms);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
   }
 }

@@ -58,6 +58,52 @@ export interface ProvidedCapability {
 }
 
 /**
+ * What the previous generation published, handed to `migrate` during
+ * replacement. The old generation is still live (serving) while the
+ * candidate prepares — `migrate` runs inside the candidate's scope, after
+ * its `setup`, so it can read old state and re-provide it.
+ *
+ * @public
+ */
+export interface MigrationPrevious {
+  readonly pluginId: string;
+  readonly generation: string;
+  readonly version: string;
+  /**
+   * The previous generation's state schema version — the `stateVersion`
+   * its definition declared. Switch on this, not the plugin version,
+   * when the shape of the provided values changed independently of
+   * releases. `undefined` when the previous definition declared none.
+   */
+  readonly stateVersion: string | undefined;
+  /** capabilityId → value the previous generation published. */
+  readonly provided: ReadonlyMap<string, unknown>;
+}
+
+/**
+ * The context handed to a definition's `drain` hook. The old generation's
+ * scope is still alive; `drain` lets in-flight work finish before the
+ * disposers run. The signal aborts when the drain timeout expires.
+ *
+ * @public
+ */
+export interface DrainContext {
+  readonly pluginId: string;
+  readonly generation: string;
+  readonly signal: AbortSignal;
+}
+
+/**
+ * The result of a health check: readiness gate or on-demand probe.
+ *
+ * @public
+ */
+export interface HealthStatus {
+  readonly ok: boolean;
+  readonly message?: string | undefined;
+}
+
+/**
  * The per-activation object handed to setup. Everything a plugin touches
  * flows through here — there are no globals. The context is live
  * only for this generation; its scope is disposed when the generation
@@ -65,8 +111,10 @@ export interface ProvidedCapability {
  *
  * @throws Methods throw structured MoltError values. require and optional use
  * INVALID_STATE with details.reason = undeclared-requirement for undeclared
- * tokens; provide uses ACTIVATION_FAILED for undeclared or duplicated
- * tokens; contribute uses INVALID_DEFINITION for duplicate ids and
+ * tokens; provide uses ACTIVATION_FAILED for undeclared tokens, and for
+ * duplicated tokens outside the `migrate` hook (during migration a provide
+ * overwrites a value `setup` staged, so the hook owns the final values);
+ * contribute uses INVALID_DEFINITION for duplicate ids and
  * INVALID_STATE for post-commit staging.
  * @public
  */
@@ -76,6 +124,13 @@ export interface PluginContext {
   /** Aborted before the generation's disposers run. */
   readonly signal: AbortSignal;
   readonly scope: Scope;
+  /**
+   * The plugin's effective configuration: the definition's `config` merged
+   * with install-time overrides, validated, frozen. Shared by every
+   * generation of the plugin; `updateConfig` replaces the object a later
+   * generation sees — a generation keeps the object it started with.
+   */
+  readonly config: Readonly<Record<string, unknown>>;
   require<T>(capability: Capability<T>): T;
   optional<T>(capability: Capability<T>): T | undefined;
   provide<T>(capability: Capability<T>, value: T): void;
@@ -110,6 +165,54 @@ export interface PluginDefinition {
   readonly setup: (
     context: PluginContext,
   ) => void | DisposableLike | Promise<void | DisposableLike>;
+  /**
+   * Default configuration, merged with install-time overrides and validated
+   * by `validateConfig`. Frozen at install; visible as `ctx.config`.
+   */
+  readonly config?: Record<string, unknown> | undefined;
+  /**
+   * Validates the effective configuration (definition defaults merged with
+   * install overrides, or a later `updateConfig`). Returns human-readable
+   * error strings; an empty array means valid. Runs at install, replace,
+   * and every `updateConfig` — a failing validation rejects the operation.
+   */
+  readonly validateConfig?:
+    ((config: Readonly<Record<string, unknown>>) => readonly string[]) | undefined;
+  /**
+   * Version of the state schema this plugin's `migrate` hook understands,
+   * independent of the plugin `version`. When a replacement carries state
+   * across generations, `migrate` receives the previous generation's
+   * `stateVersion` and can switch on it instead of parsing the plugin
+   * version. Bump it when the shape of the values you publish changes.
+   */
+  readonly stateVersion?: string | undefined;
+  /**
+   * State migration hook, run during replacement after the candidate's
+   * `setup` and before commit. Receives what the previous generation
+   * published; may call `ctx.provide` to carry values over — during
+   * `migrate` a provide overwrites a value `setup` staged, so the hook
+   * owns the final published values. A throw fails the replacement and
+   * keeps the old generation serving. Runs inside the candidate's scope,
+   * so scope-owned resources are cleaned up on failure. Runs only on
+   * replacement, never on first start or restart.
+   */
+  readonly migrate?:
+    ((previous: MigrationPrevious, context: PluginContext) => void | Promise<void>) | undefined;
+  /**
+   * Drain hook, run on the OLD generation after a replacement commits and
+   * before its scope is disposed. Lets in-flight work finish; bounded by
+   * the drain timeout, after which disposal proceeds regardless. A throw
+   * is collected like a disposal failure — the replacement already
+   * succeeded.
+   */
+  readonly drain?: ((context: DrainContext) => void | Promise<void>) | undefined;
+  /**
+   * Health check, run as a post-commit readiness gate after activation and
+   * replacement, and on demand via `runtime.checkHealth`. A failing gate
+   * rolls the operation back. Keep it fast and side-effect free.
+   */
+  readonly healthCheck?:
+    ((context: PluginContext) => HealthStatus | Promise<HealthStatus>) | undefined;
 }
 
 function invalid(message: string, details?: Record<string, unknown>): MoltError {
@@ -269,12 +372,32 @@ export function validateDefinition(definition: PluginDefinition): MoltError | un
       });
     }
   }
+
+  if (definition.config !== undefined) {
+    if (
+      typeof definition.config !== 'object' ||
+      definition.config === null ||
+      Array.isArray(definition.config)
+    ) {
+      return invalid(`plugin ${owner} has a non-record config`, { pluginId: owner });
+    }
+  }
+  if (definition.stateVersion !== undefined && typeof definition.stateVersion !== 'string') {
+    return invalid(`plugin ${owner} has a non-string stateVersion`, { pluginId: owner });
+  }
+  const hookFields = ['validateConfig', 'migrate', 'drain', 'healthCheck'] as const;
+  for (const field of hookFields) {
+    const hook = definition[field];
+    if (hook !== undefined && typeof hook !== 'function') {
+      return invalid(`plugin ${owner} has a non-function ${field}`, { pluginId: owner });
+    }
+  }
   return undefined;
 }
 
 /**
- * Shallow-freezes the definition, its arrays, and their entries.
- * Returns the same object, frozen.
+ * Shallow-freezes the definition, its arrays, their entries, and the config
+ * record. Returns the same object, frozen.
  */
 export function freezeDefinition<T extends PluginDefinition>(definition: T): T {
   Object.freeze(definition);
@@ -291,6 +414,9 @@ export function freezeDefinition<T extends PluginDefinition>(definition: T): T {
       Object.freeze(provided.capability);
       Object.freeze(provided);
     }
+  }
+  if (definition.config !== undefined) {
+    Object.freeze(definition.config);
   }
   return definition;
 }

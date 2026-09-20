@@ -23,6 +23,9 @@ export type { ContributionEntry, ContributionKey, ContributionSnapshot } from '.
 export type {
   DiagnosticInput,
   DisposableLike,
+  DrainContext,
+  HealthStatus,
+  MigrationPrevious,
   PluginContext,
   PluginDefinition,
   PluginStatus,
@@ -31,5 +34,15 @@ export type {
 } from './definition.js';
 export type { DisposalReport, MoltErrorInit, RuntimeErrorCode } from './errors.js';
 export type { BlockedDiagnostic } from './resolver.js';
-export type { Runtime, RuntimeInspection, RuntimeListener, RuntimeOptions } from './runtime.js';
+export type {
+  InstallOptions,
+  ReplaceOptions,
+  Runtime,
+  RuntimeInspection,
+  RuntimeListener,
+  RuntimeOptions,
+  StartOptions,
+  StopOptions,
+  TimeoutOptions,
+} from './runtime.js';
 export type { Scope } from './scope.js';

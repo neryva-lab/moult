@@ -48,13 +48,22 @@ function disposedError(reason: string, cause?: unknown): MoltError {
 }
 
 export class ScopeImpl implements Scope {
-  readonly #controller = new AbortController();
+  // Created lazily on first signal access: most generations never hand their
+  // signal to user code, and AbortController construction showed up as fixed
+  // per-generation cost in CPU profiles.
+  #controller: AbortController | undefined;
   #entries: Entry[] = [];
   #disposed = false;
   #disposePromise: Promise<DisposalReport> | undefined;
 
   get signal(): AbortSignal {
-    return this.#controller.signal;
+    const controller = (this.#controller ??= new AbortController());
+    if (this.#disposed) {
+      // Dispose may have run before the controller existed (it is created
+      // lazily). A signal observed after disposal must already be aborted.
+      controller.abort();
+    }
+    return controller.signal;
   }
 
   isDisposed(): boolean {
@@ -107,8 +116,8 @@ export class ScopeImpl implements Scope {
     }
     this.#disposed = true;
     // The signal aborts BEFORE any disposer runs: in-flight work observes the
-    // abort while cleanup is still ahead of it.
-    this.#controller.abort();
+    // abort while cleanup is still ahead of it. Never requested, never built.
+    this.#controller?.abort();
     const entries = this.#entries;
     this.#entries = [];
     const errors: unknown[] = [];

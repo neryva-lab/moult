@@ -194,8 +194,10 @@ async function runOperation(
         return false;
       }
       const definition = buildDefinition(plugin, world, minted, behaviors, opIndex);
-      const engineError = await rejectionOf(runtime.replace(definition));
-      compareOutcome(model.replace(plugin, opIndex), engineError);
+      const engineError = await rejectionOf(
+        runtime.replace(definition, operation.strict ? { strictDependents: true } : undefined),
+      );
+      compareOutcome(model.replace(plugin, opIndex, operation.strict), engineError);
       return true;
     }
     case 'uninstall': {

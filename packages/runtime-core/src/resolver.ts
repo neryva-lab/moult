@@ -2,7 +2,8 @@
 // The resolver is pure: no I/O, no timing, no lifecycle; the runtime feeds
 // it state and consumes the plan. Determinism contract: identical inputs in
 // any order produce identical plans (candidates sorted, ready sets
-// lexicographic).
+// lexicographic). All traversals are iterative: deep dependency graphs must
+// not overflow the call stack.
 
 import type { Capability } from './capability.js';
 import type { PluginDefinition, PluginStatus } from './definition.js';
@@ -80,17 +81,34 @@ export interface BlockedDiagnostic {
 
 export interface ResolutionInput {
   readonly definitions: readonly PluginDefinition[];
-  /** Selection needs statuses: stopped providers are visible, never selectable. */
+  /**
+   * Selection needs statuses. Selectability is tiered: active providers
+   * (tier 1) always win; stopped providers (tier 2) are revived only when
+   * no tier-1 candidate satisfies the requirement — starting a root is
+   * explicit consent to revive its provider closure (F1 restart), but a
+   * stopped provider never silently beats an active one. The root itself
+   * is always tier 1.
+   */
   readonly statuses: ReadonlyMap<string, PluginStatus>;
   readonly hostProviders: ReadonlyMap<string, HostProvider>;
   /** The resolver produces the provider closure of this plugin, root last. */
   readonly root: string;
+  /**
+   * Treat every definition as selectable regardless of status. Static
+   * validation (`runtime.validate`) asks "could this graph ever activate?"
+   * rather than "can it activate right now?".
+   */
+  readonly ignoreStopped?: boolean | undefined;
 }
 
 interface Candidate {
   readonly pluginId: string | null;
   readonly capabilityVersion: string;
-  readonly selectable: boolean;
+  /**
+   * Selection tier: 1 = preferred (active, host, or the root itself);
+   * 2 = stopped fallback, revived only when no tier-1 candidate exists.
+   */
+  readonly tier: 1 | 2;
 }
 
 const HOST_EDGE_TARGET = '(host)';
@@ -106,6 +124,7 @@ function blockedDiagnostic(
   optional: boolean,
   candidates: readonly Candidate[],
   compatible: readonly Candidate[],
+  selected: readonly Candidate[],
 ): BlockedDiagnostic {
   return {
     pluginId,
@@ -113,17 +132,86 @@ function blockedDiagnostic(
     candidates: candidates.map((candidate) => ({
       pluginId: candidate.pluginId,
       version: candidate.capabilityVersion,
-      verdict: compatible.includes(candidate)
-        ? candidate.selectable
+      verdict: !compatible.includes(candidate)
+        ? 'incompatible'
+        : selected.includes(candidate)
           ? 'ok'
-          : 'stopped'
-        : 'incompatible',
+          : 'stopped',
     })),
   };
 }
 
+/** A minimal binary heap ordered lexicographically. */
+class StringHeap {
+  #items: string[] = [];
+
+  get size(): number {
+    return this.#items.length;
+  }
+
+  push(value: string): void {
+    const items = this.#items;
+    items.push(value);
+    let index = items.length - 1;
+    while (index > 0) {
+      const parent = (index - 1) >> 1;
+      // Indexed access is guarded: noUncheckedIndexedAccess reports
+      // undefined for every index, so the comparisons below are total.
+      const parentValue = items[parent];
+      const currentValue = items[index];
+      if (parentValue === undefined || currentValue === undefined || parentValue <= currentValue) {
+        break;
+      }
+      items[parent] = currentValue;
+      items[index] = parentValue;
+      index = parent;
+    }
+  }
+
+  pop(): string | undefined {
+    const items = this.#items;
+    const top = items[0];
+    const last = items.pop();
+    if (items.length > 0 && last !== undefined) {
+      items[0] = last;
+      let index = 0;
+      for (;;) {
+        const left = index * 2 + 1;
+        const right = left + 1;
+        let smallest = index;
+        const smallestValue = items[smallest];
+        const leftValue = items[left];
+        if (leftValue !== undefined && (smallestValue === undefined || leftValue < smallestValue)) {
+          smallest = left;
+        }
+        const nextSmallestValue = items[smallest];
+        const rightValue = items[right];
+        if (
+          rightValue !== undefined &&
+          (nextSmallestValue === undefined || rightValue < nextSmallestValue)
+        ) {
+          smallest = right;
+        }
+        if (smallest === index) {
+          break;
+        }
+        const indexValue = items[index];
+        const swapValue = items[smallest];
+        if (indexValue === undefined || swapValue === undefined) {
+          break;
+        }
+        items[index] = swapValue;
+        items[smallest] = indexValue;
+        index = smallest;
+      }
+    }
+    return top;
+  }
+}
+
 export function resolve(input: ResolutionInput): ResolutionPlan {
   const { definitions, statuses, hostProviders, root } = input;
+  const ignoreStopped = input.ignoreStopped === true;
 
   // 1–2: defensive re-validation and duplicate rejection (install validates
   // already; the resolver never trusts its input).
@@ -152,9 +240,7 @@ export function resolve(input: ResolutionInput): ResolutionPlan {
   }
 
   // 3: candidate pool — host providers plus every definition declaring the
-  // token. Stopped definitions stay visible for diagnostics but are never
-  // selectable (a host must not have a user-disabled plugin silently
-  // restarted).
+  // token, each tagged with its selection tier (see ResolutionInput).
   const candidates = new Map<string, Candidate[]>();
   const addCandidate = (capabilityId: string, candidate: Candidate): void => {
     const list = candidates.get(capabilityId);
@@ -168,15 +254,19 @@ export function resolve(input: ResolutionInput): ResolutionPlan {
     addCandidate(capabilityId, {
       pluginId: null,
       capabilityVersion: host.capability.version,
-      selectable: true,
+      tier: 1,
     });
   }
   for (const definition of definitions) {
+    const id = definition.id;
+    const isRoot = id === root;
+    const status = statuses.get(id);
+    const tier: 1 | 2 = isRoot || ignoreStopped || status !== 'stopped' ? 1 : 2;
     for (const provided of definition.provides ?? []) {
       addCandidate(provided.capability.id, {
-        pluginId: definition.id,
+        pluginId: id,
         capabilityVersion: provided.capability.version,
-        selectable: statuses.get(definition.id) !== 'stopped',
+        tier,
       });
     }
   }
@@ -185,12 +275,27 @@ export function resolve(input: ResolutionInput): ResolutionPlan {
   const edges: ResolutionEdge[] = [];
   const diagnostics: BlockedDiagnostic[] = [];
 
-  // 4: requirement walk — definitions sorted by id, requirements in declared
-  // order, so diagnostics and edges are deterministic under input permutation.
-  const sortedDefinitions = [...byId.values()].sort((a, b) =>
-    a.id < b.id ? -1 : a.id > b.id ? 1 : 0,
-  );
-  for (const definition of sortedDefinitions) {
+  // 4: requirement fixpoint — starting from the root, select providers for
+  // every requirement in lexicographic definition order. Only the selected
+  // closure is walked: a broken requirement on a definition nobody selects
+  // cannot poison this activation. Selection is order-independent (the pool
+  // is static), so the lexicographic worklist keeps diagnostics and edges
+  // deterministic.
+  const selected = new Set<string>([root]);
+  const worklist = new StringHeap();
+  worklist.push(root);
+  let node = worklist.pop();
+  while (node !== undefined) {
+    const definition = byId.get(node);
+    if (definition === undefined) {
+      // Internal invariant: the worklist only holds ids taken from byId.
+      throw new MoltError({
+        code: 'INVALID_STATE',
+        message: `resolution worklist referenced unknown plugin ${node}`,
+        pluginId: root,
+        details: { reason: 'resolver-invariant' },
+      });
+    }
     for (const requirement of definition.requires ?? []) {
       const capabilityId = requirement.capability.id;
       const range = requirement.range;
@@ -198,21 +303,29 @@ export function resolve(input: ResolutionInput): ResolutionPlan {
       const compatible = pool.filter((candidate) =>
         satisfiesRange(candidate.capabilityVersion, range),
       );
-      const selectable = compatible.filter((candidate) => candidate.selectable);
-      const diagnostic = blockedDiagnostic(
-        definition.id,
-        capabilityId,
-        range,
-        requirement.optional === true,
-        pool,
-        compatible,
-      );
+      // Tiered selection: active providers win; stopped providers are
+      // revived only when no tier-1 candidate satisfies the requirement;
+      // lazy providers never win implicitly.
+      const tier1 = compatible.filter((candidate) => candidate.tier === 1);
+      const tier2 = compatible.filter((candidate) => candidate.tier === 2);
+      const selectable = tier1.length > 0 ? tier1 : tier2;
+      // Diagnostics are built lazily: the happy path records none.
+      const diagnostic = (): BlockedDiagnostic =>
+        blockedDiagnostic(
+          definition.id,
+          capabilityId,
+          range,
+          requirement.optional === true,
+          pool,
+          compatible,
+          selectable,
+        );
 
       if (selectable.length === 0) {
         if (requirement.optional === true) {
           // Visibility without failure: no edge, diagnostic kept.
           if (pool.length > 0) {
-            diagnostics.push(diagnostic);
+            diagnostics.push(diagnostic());
           }
           continue;
         }
@@ -222,7 +335,7 @@ export function resolve(input: ResolutionInput): ResolutionPlan {
             message: `no provider for capability ${capabilityId}`,
             pluginId: definition.id,
             capabilityId,
-            details: { blocked: [diagnostic] },
+            details: { blocked: [diagnostic()] },
           });
         }
         if (compatible.length === 0) {
@@ -231,16 +344,17 @@ export function resolve(input: ResolutionInput): ResolutionPlan {
             message: `no provider of ${capabilityId} satisfies ${range}`,
             pluginId: definition.id,
             capabilityId,
-            details: { blocked: [diagnostic] },
+            details: { blocked: [diagnostic()] },
           });
         }
-        // Compatible but stopped: real providers exist, none usable.
+        // Selectable is empty while compatible is not: every compatible
+        // candidate is lazy, so nothing can be chosen implicitly.
         throw new MoltError({
           code: 'MISSING_CAPABILITY',
-          message: `every provider of ${capabilityId} is stopped`,
+          message: `every provider of ${capabilityId} is lazy; start one explicitly`,
           pluginId: definition.id,
           capabilityId,
-          details: { blocked: [diagnostic] },
+          details: { blocked: [diagnostic()] },
         });
       }
 
@@ -250,7 +364,7 @@ export function resolve(input: ResolutionInput): ResolutionPlan {
           message: `${selectable.length} providers satisfy ${capabilityId}@${range}`,
           pluginId: definition.id,
           capabilityId,
-          details: { blocked: [diagnostic] },
+          details: { blocked: [diagnostic()] },
         });
       }
 
@@ -284,115 +398,108 @@ export function resolve(input: ResolutionInput): ResolutionPlan {
           range,
           optional: requirement.optional === true,
         });
+        if (candidate.pluginId !== null && !selected.has(candidate.pluginId)) {
+          selected.add(candidate.pluginId);
+          worklist.push(candidate.pluginId);
+        }
       }
     }
+    node = worklist.pop();
   }
 
-  // 5–6: cycle detection over selected edges — a provider ignored by
-  // selection cannot create a cycle. Full traversal path is reported.
-  const adjacency = new Map<string, string[]>();
+  // 5: Kahn topological order over the selected closure with a
+  // lexicographic ready heap — providers before consumers, root last. A
+  // dependency cycle leaves nodes unconsumed; the reported path is found by
+  // walking the remainder until a node repeats. Iterative throughout.
+  const dependencies = new Map<string, Set<string>>();
+  const dependentsOf = new Map<string, Set<string>>();
+  for (const id of selected) {
+    dependencies.set(id, new Set<string>());
+  }
   for (const edge of edges) {
-    const list = adjacency.get(edge.from);
-    if (list === undefined) {
-      adjacency.set(edge.from, [edge.to]);
-    } else {
-      list.push(edge.to);
+    if (edge.to === HOST_EDGE_TARGET || !selected.has(edge.to) || edge.to === edge.from) {
+      continue;
     }
-  }
-  const UNVISITED = 0;
-  const VISITING = 1;
-  const DONE = 2;
-  const marks = new Map<string, number>();
-  for (const definition of byId.values()) {
-    marks.set(definition.id, UNVISITED);
-  }
-  const detectCycle = (node: string, stack: string[]): void => {
-    const mark = marks.get(node);
-    if (mark === VISITING) {
-      const start = stack.indexOf(node);
-      const path = start >= 0 ? [...stack.slice(start), node] : [node, node];
-      throw new MoltError({
-        code: 'DEPENDENCY_CYCLE',
-        message: `dependency cycle: ${path.join(' -> ')}`,
-        pluginId: root,
-        path,
-      });
+    const deps = dependencies.get(edge.from);
+    if (deps !== undefined) {
+      deps.add(edge.to);
     }
-    if (mark === DONE) {
-      return;
+    // A distinct set: in-degree counts distinct providers, so each dependent
+    // must be decremented exactly once per provider. A plain list would
+    // decrement one consumer twice when two capabilities select the same
+    // (consumer, provider) pair, emitting the consumer before its other
+    // provider and breaking the topological order.
+    let dependents = dependentsOf.get(edge.to);
+    if (dependents === undefined) {
+      dependents = new Set<string>();
+      dependentsOf.set(edge.to, dependents);
     }
-    marks.set(node, VISITING);
-    stack.push(node);
-    for (const next of adjacency.get(node) ?? []) {
-      detectCycle(next, stack);
-    }
-    stack.pop();
-    marks.set(node, DONE);
-  };
-  for (const nodeId of [...byId.keys()].sort()) {
-    detectCycle(nodeId, []);
+    dependents.add(edge.from);
   }
 
-  // 7: closure of the root over requirement edges, then Kahn topological
-  // order with a lexicographic ready set — providers before consumers.
-  const closure = new Set<string>([root]);
-  const collect = (node: string): void => {
-    for (const next of adjacency.get(node) ?? []) {
-      if (next === HOST_EDGE_TARGET || closure.has(next)) {
-        continue;
-      }
-      closure.add(next);
-      collect(next);
-    }
-  };
-  collect(root);
-
-  const dependenciesWithinClosure = new Map<string, Set<string>>();
-  for (const node of closure) {
-    const deps = new Set<string>();
-    for (const next of adjacency.get(node) ?? []) {
-      if (closure.has(next) && next !== node) {
-        deps.add(next);
-      }
-    }
-    dependenciesWithinClosure.set(node, deps);
-  }
-
-  // Kahn's algorithm; the ready set is kept sorted so the order is a pure
-  // function of the graph.
   const inDegree = new Map<string, number>();
-  const dependentsOf = new Map<string, string[]>();
-  for (const [node, deps] of dependenciesWithinClosure) {
-    inDegree.set(node, deps.size);
-    for (const dep of deps) {
-      const list = dependentsOf.get(dep);
-      if (list === undefined) {
-        dependentsOf.set(dep, [node]);
-      } else {
-        list.push(node);
-      }
+  for (const [id, deps] of dependencies) {
+    inDegree.set(id, deps.size);
+  }
+  const ready = new StringHeap();
+  for (const [id, degree] of inDegree) {
+    if (degree === 0) {
+      ready.push(id);
     }
   }
-  const ready = [...closure].filter((node) => (inDegree.get(node) ?? 0) === 0).sort();
   const order: string[] = [];
-  while (ready.length > 0) {
-    const node = ready.shift();
-    if (node === undefined) {
-      break; // unreachable: loop condition guarantees a value
-    }
-    order.push(node);
-    for (const dependent of dependentsOf.get(node) ?? []) {
-      const current = inDegree.get(dependent);
-      if (current === undefined) {
-        continue;
-      }
-      const remaining = current - 1;
+  const consumed = new Set<string>();
+  let next = ready.pop();
+  while (next !== undefined) {
+    order.push(next);
+    consumed.add(next);
+    for (const dependent of dependentsOf.get(next) ?? []) {
+      const remaining = (inDegree.get(dependent) ?? 0) - 1;
       inDegree.set(dependent, remaining);
       if (remaining === 0) {
         ready.push(dependent);
       }
     }
-    ready.sort();
+    next = ready.pop();
+  }
+
+  if (order.length !== selected.size) {
+    // Cycle: every remaining node still has a dependency inside the
+    // remainder, so following requirement edges from any of them must
+    // eventually repeat a node.
+    const remaining = new Set<string>();
+    for (const id of selected) {
+      if (!consumed.has(id)) {
+        remaining.add(id);
+      }
+    }
+    let start: string | undefined;
+    for (const id of [...remaining].sort()) {
+      start = id;
+      break;
+    }
+    const trail: string[] = [];
+    const seenAt = new Map<string, number>();
+    let cursor = start;
+    while (cursor !== undefined && !seenAt.has(cursor)) {
+      seenAt.set(cursor, trail.length);
+      trail.push(cursor);
+      let following: string | undefined;
+      const outs = [...(dependencies.get(cursor) ?? [])].filter((id) => remaining.has(id)).sort();
+      for (const id of outs) {
+        following = id;
+        break;
+      }
+      cursor = following;
+    }
+    const cycleStart = cursor === undefined ? 0 : (seenAt.get(cursor) ?? 0);
+    const path = [...trail.slice(cycleStart), ...(cursor === undefined ? [] : [cursor])];
+    throw new MoltError({
+      code: 'DEPENDENCY_CYCLE',
+      message: `dependency cycle: ${path.join(' -> ')}`,
+      pluginId: root,
+      path,
+    });
   }
 
   return {
@@ -418,7 +525,7 @@ export function resolveCandidate(input: {
   const diagnostics: BlockedDiagnostic[] = [];
 
   for (const requirement of definition.requires ?? []) {
-    const pool = providers
+    const pool: Candidate[] = providers
       .filter(
         (provider) =>
           provider.capability.id === requirement.capability.id &&
@@ -429,7 +536,7 @@ export function resolveCandidate(input: {
       .map((provider) => ({
         pluginId: provider.pluginId,
         capabilityVersion: provider.capability.version,
-        selectable: true,
+        tier: 1,
       }));
     const compatible = pool.filter((candidate) =>
       satisfiesRange(candidate.capabilityVersion, requirement.range),
@@ -442,6 +549,7 @@ export function resolveCandidate(input: {
       requirement.optional === true,
       pool,
       compatible,
+      selectable,
     );
 
     if (selectable.length === 0) {

@@ -58,7 +58,7 @@ The package exports `fakeResources`, `pluginHarness`,
 
 ## Status and documentation
 
-Implemented and packaged at `0.1.1`; publication is pending. See the
+Implemented and published. See the
 [Moult repository](https://github.com/neryva-lab/moult), the
 [adapter design](https://github.com/neryva-lab/moult/blob/main/docs/notes/05-adapters-and-host-integration.md),
 and the [lifecycle guarantees](https://github.com/neryva-lab/moult/blob/main/docs/guarantees.md).

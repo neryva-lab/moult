@@ -7,8 +7,9 @@ import { MoltError } from './errors.js';
 import { isValidVersion } from './internal/semver.js';
 
 // ID grammar: dotted namespaces, lowercase, no empty segments, no leading
-// digits or hyphens. Shared with plugin ids.
-const ID_PATTERN = /^[a-z][a-z0-9]*(\.[a-z][a-z0-9-]*)*$/;
+// digits. Hyphens are allowed inside every segment (so `memory-storage` is a
+// valid plugin id). Shared with plugin ids.
+const ID_PATTERN = /^[a-z][a-z0-9-]*(\.[a-z][a-z0-9-]*)*$/;
 
 export function isValidRuntimeId(id: string): boolean {
   return typeof id === 'string' && ID_PATTERN.test(id);

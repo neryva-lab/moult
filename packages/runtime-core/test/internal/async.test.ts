@@ -3,7 +3,6 @@
 // in isolation.
 
 import {
-  AsyncMutex,
   BoundedLog,
   createDeferred,
   idempotent,
@@ -22,36 +21,6 @@ describe('createDeferred', () => {
     const failure = new Error('boom');
     deferred.reject(failure);
     await expect(deferred.promise).rejects.toBe(failure);
-  });
-});
-
-describe('AsyncMutex', () => {
-  it('runs sections in call order', async () => {
-    const mutex = new AsyncMutex();
-    const order: string[] = [];
-    const first = mutex.runExclusive(async () => {
-      await Promise.resolve();
-      order.push('first');
-    });
-    const second = mutex.runExclusive(() => {
-      order.push('second');
-    });
-    await Promise.all([first, second]);
-    expect(order).toEqual(['first', 'second']);
-  });
-
-  it('a failing section never blocks the next one', async () => {
-    const mutex = new AsyncMutex();
-    const order: string[] = [];
-    const failing = mutex.runExclusive(() => {
-      throw new Error('section failed');
-    });
-    const next = mutex.runExclusive(() => {
-      order.push('next-ran');
-    });
-    await expect(failing).rejects.toThrow('section failed');
-    await next;
-    expect(order).toEqual(['next-ran']);
   });
 });
 

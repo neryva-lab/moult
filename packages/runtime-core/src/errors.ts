@@ -7,9 +7,10 @@
  * (`MISSING_CAPABILITY`, `INCOMPATIBLE_CAPABILITY`, `AMBIGUOUS_PROVIDER`,
  * `DEPENDENCY_CYCLE`), identity and definition failures (`DUPLICATE_PLUGIN`,
  * `INVALID_DEFINITION`), lifecycle failures (`ACTIVE_DEPENDENTS`,
- * `ACTIVATION_FAILED`, `DISPOSAL_FAILED`, `REPLACEMENT_FAILED`), and state
- * misuse (`INVALID_STATE`). Codes are part of the API contract — tests and
- * hosts match on them, never on message text.
+ * `ACTIVATION_FAILED`, `DISPOSAL_FAILED`, `REPLACEMENT_FAILED`), timeout
+ * failures (`SETUP_TIMEOUT`, `DISPOSAL_TIMEOUT`), and state misuse
+ * (`INVALID_STATE`). Codes are part of the API contract — tests and hosts
+ * match on them, never on message text.
  *
  * @public
  */
@@ -24,6 +25,8 @@ export type RuntimeErrorCode =
   | 'ACTIVATION_FAILED'
   | 'DISPOSAL_FAILED'
   | 'REPLACEMENT_FAILED'
+  | 'SETUP_TIMEOUT'
+  | 'DISPOSAL_TIMEOUT'
   | 'INVALID_STATE';
 
 /**

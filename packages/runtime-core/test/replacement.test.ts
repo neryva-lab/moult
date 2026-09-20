@@ -332,13 +332,46 @@ describe('replacement contract', () => {
     await expectMoltRejection(runtime.start('test.provider'), 'INVALID_STATE');
   });
 
-  it('INV-15: replacing a provider with active dependents is rejected — zero state change, dependent path named', async () => {
+  it('INV-15: default replacement transactionally rebinds dependents — strictDependents opts into v1 rejection', async () => {
+    const counters = makeCounters();
+    const seen: { read(): number }[] = [];
+    const runtime = createRuntime();
+    runtime.install(storagePlugin(counters));
+    await runtime.start('test.provider');
+    runtime.install(consumerPlugin((value) => seen.push(value)));
+    await runtime.start('test.consumer');
+    const firstValue = seen[0];
+
+    // Default: the dependent is rebound onto the new provider generation —
+    // the consumer keeps serving through the transaction.
+    const values: unknown[] = [];
+    runtime.subscribe((event) => {
+      if (event.type === 'replaced') {
+        values.push(`${event.pluginId}@${event.generation}`);
+      }
+    });
+    await runtime.replace(storagePlugin(counters, { version: '2.0.0' }));
+    expect(runtime.getStatus('test.provider')).toBe('active');
+    expect(runtime.getStatus('test.consumer')).toBe('active');
+    // The consumer's setup ran a second time, against the NEW provider
+    // generation — a fresh storage value, and its resolved provider edges
+    // point at the new generation.
+    expect(seen).toHaveLength(2);
+    expect(seen[1]).not.toBe(firstValue);
+    expect(values.filter((entry) => String(entry).startsWith('test.provider@'))).toHaveLength(1);
+    expect(values.filter((entry) => String(entry).startsWith('test.consumer@'))).toHaveLength(1);
+    // The old provider generation retired exactly once (its scope held the
+    // counted resource; the rebound consumer's old scope held none).
+    expect(counters.counters.released).toBe(1);
+  });
+
+  it('INV-15: strictDependents rejects replacement with active dependents — zero state change, dependent path named', async () => {
     const counters = makeCounters();
     const { runtime } = await startProviderWithConsumer(counters);
     const capabilitiesBefore = structuredClone(runtime.inspect().capabilities);
 
     const error = await expectMoltRejection(
-      runtime.replace(storagePlugin(counters, { version: '2.0.0' })),
+      runtime.replace(storagePlugin(counters, { version: '2.0.0' }), { strictDependents: true }),
       'REPLACEMENT_FAILED',
     );
 

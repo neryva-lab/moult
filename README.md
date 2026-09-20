@@ -88,7 +88,7 @@ to roll back arbitrary external effects.
 
 | Package                                             | Status                                                                       |
 | --------------------------------------------------- | ---------------------------------------------------------------------------- |
-| [`@moult/runtime`](packages/runtime-core/README.md) | The core runtime. Implemented; not yet released.                             |
+| [`@moult/runtime`](packages/runtime-core/README.md) | The core runtime.                                                            |
 | [`@moult/test`](packages/test/README.md)            | Implemented support package for ownership, replacement, and leak assertions. |
 | [`@moult/events`](packages/events/README.md)        | Implemented typed, generation-scoped event capability.                       |
 | [`@moult/react`](packages/react/README.md)          | Implemented committed-snapshot React adapter.                                |

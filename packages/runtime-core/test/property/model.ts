@@ -7,6 +7,18 @@
 // is written from the spec documents, not from runtime.ts, so a shared
 // misunderstanding is caught by the unit inventory rather than replicated
 // here.
+//
+// Engine semantics mirrored here (v2):
+// - Resolution walks only the selected closure from the root (a broken
+//   requirement on an unselected definition cannot poison an activation).
+// - Provider selection is tiered: active/host/root providers (tier 1) win;
+//   stopped providers (tier 2) are revived only when no tier-1 candidate
+//   satisfies the requirement.
+// - `replace` rebinds the transitive active dependent closure
+//   transactionally by default; every rebound dependent emits `replaced`
+//   and gets a fresh generation id.
+// - A failed start rolls back committed generations with balancing
+//   `stopped` events (F8), in reverse commit order.
 
 import type { RuntimeErrorCode } from '../../src/index.js';
 import type { PluginStatus } from '../../src/index.js';
@@ -43,6 +55,13 @@ interface ModelSelection {
 
 type ModelProviderSelections = ReadonlyMap<string, readonly ModelSelection[]>;
 
+interface ModelCandidate {
+  readonly pluginId: string | null;
+  readonly capabilityVersion: string;
+  /** 1 = preferred (active, host, or the root); 2 = stopped fallback. */
+  readonly tier: 1 | 2;
+}
+
 export class ModelRuntime {
   readonly world: World;
   readonly plugins = new Map<string, ModelPlugin>();
@@ -54,8 +73,10 @@ export class ModelRuntime {
   readonly activationOrder: string[] = [];
   /** generationId → resources acquired by its setup (live generations only). */
   readonly genResources = new Map<string, number>();
-  /** generationId → provider generationIds consumed (recorded at commit). */
-  readonly genConsumes = new Map<string, Set<string>>();
+  /** generationId → capabilityId → provider generationIds (resolved edges). */
+  readonly genEdges = new Map<string, Map<string, Set<string>>>();
+  /** generationId → declared requirement ranges, snapshotted from the definition. */
+  readonly genRanges = new Map<string, ReadonlyArray<{ capabilityId: string; range: string }>>();
   /** generationId → the definition's failDisposerThrow flag. */
   readonly genDisposeThrows = new Map<string, boolean>();
   readonly events: ModelEvent[] = [];
@@ -138,7 +159,7 @@ export class ModelRuntime {
         break;
       }
       if (target.status === 'active') {
-        continue; // live providers are reused
+        continue; // live providers are reused, never restarted
       }
       const activated = this.#activate(target, resolution);
       if (!activated.ok) {
@@ -156,14 +177,16 @@ export class ModelRuntime {
       }
     }
     if (failure !== undefined) {
-      // INV-01: every generation committed by this attempt is disposed —
-      // resources released, publications withdrawn, records stopped, no
-      // stopped events emitted.
+      // F8: every generation committed by this attempt is disposed — each
+      // committed generation emitted 'started', so each disposal emits the
+      // balancing 'stopped', in reverse commit order. Records end stopped
+      // and errorless (the root record carries the failure).
       for (const generationId of [...committed].reverse()) {
-        const { record: genRecord } = this.#ownerOf(generationId);
+        const { record: genRecord, id: genPluginId } = this.#ownerOf(generationId);
         genRecord.status = 'stopped';
         genRecord.generation = undefined;
         this.#withdrawGeneration(generationId);
+        this.events.push({ type: 'stopped', pluginId: genPluginId, generation: generationId });
       }
       record.status = 'stopped';
       record.hasError = true;
@@ -228,7 +251,7 @@ export class ModelRuntime {
     return { ok: true };
   }
 
-  replace(definition: WorldPlugin, runTag: number): ModelOutcome {
+  replace(definition: WorldPlugin, runTag: number, strict = false): ModelOutcome {
     if (this.disposed) {
       return { ok: false, code: 'INVALID_STATE' };
     }
@@ -248,47 +271,454 @@ export class ModelRuntime {
     if (oldGenerationId === undefined) {
       throw new Error('model: active plugin without a generation');
     }
-    // Any active dependent rejects the replacement before
-    // a candidate scope exists — no events, zero state change.
-    const dependents = this.#dependentsOfGeneration(oldGenerationId);
-    if (dependents.length > 0) {
+
+    // The transitive active dependent closure (provider-first), shared by
+    // both policies.
+    const closure = this.#rebindClosure(oldGenerationId);
+    if (strict && closure.length > 0) {
+      // `strictDependents` opts back into the v1 rejection: rejected before
+      // any candidate scope exists — no events, no record error, zero state
+      // change. Reports direct dependents, as v1 did.
       return { ok: false, code: 'REPLACEMENT_FAILED' };
     }
 
-    // Candidate preparation — the old generation keeps serving (INV-07).
-    this.counter += 1;
-    const candidateId = `${definition.id}#${String(this.counter)}`;
-    const candidateProviders = this.#candidateSelections(definition);
-    const candidateFailure = this.#prepareCandidate(
-      definition,
-      oldGenerationId,
-      candidateProviders,
-    );
-    if (candidateFailure !== undefined) {
-      record.hasError = true;
-      this.events.push({ type: 'failed', pluginId: definition.id });
-      return { ok: false, code: 'REPLACEMENT_FAILED' };
+    // Claim check, before any candidate scope exists: a single-provider
+    // token may collide with no host and no unrelated active generation.
+    for (const provide of definition.provides) {
+      if (this.policyMultiple(provide.capabilityId)) {
+        continue;
+      }
+      const cap = this.world.capabilities.find((entry) => entry.id === provide.capabilityId);
+      if (cap?.host === true) {
+        return this.#replacementFailed(record, definition.id);
+      }
+      const byGeneration = this.published.get(provide.capabilityId);
+      if (byGeneration !== undefined) {
+        for (const otherGeneration of byGeneration.keys()) {
+          if (otherGeneration !== oldGenerationId) {
+            return this.#replacementFailed(record, definition.id);
+          }
+        }
+      }
     }
 
-    // Commit — engine order: candidate consumes recorded from current bindings
-    // (the old generation is still published), then withdraw old, then publish
-    // the candidate, then swap the record.
-    const consumes = this.#candidateConsumes(definition, candidateProviders);
-    const oldDisposeThrows = this.genDisposeThrows.get(oldGenerationId) === true;
-    this.#withdrawGeneration(oldGenerationId);
-    this.#publishCandidate(definition, runTag, candidateId, consumes);
-    record.definition = definition;
-    record.runTag = runTag;
-    record.generation = candidateId;
-    record.hasError = false;
-    record.status = 'active';
-    this.events.push({ type: 'replaced', pluginId: definition.id, generation: candidateId });
-    if (oldDisposeThrows) {
-      // INV-14: the replacement succeeded; the failure is inspectable and the
-      // old generation is never restored (INV-08).
-      record.hasError = true;
+    // The candidate resolves against the currently published view — the old
+    // generation keeps serving until commit, but the candidate cannot bind
+    // the generation it replaces.
+    const candidate = this.#resolveCandidate(definition);
+    if (!candidate.ok) {
+      return this.#replacementFailed(record, definition.id);
+    }
+
+    // Every dependent's declared range must still be satisfied by the
+    // rebound providers' versions. Optional requirements the candidate no
+    // longer satisfies bind nothing instead of failing the transaction.
+    const rangeCheck = this.#checkDependentRanges(definition, oldGenerationId, closure);
+    if (!rangeCheck.ok) {
+      return this.#replacementFailed(record, definition.id);
+    }
+
+    // Prepare candidates provider-first. The engine mints the generation id
+    // before setup runs, so even a failing candidate consumes a counter —
+    // and its setup effects (serves, acquisitions) really happened before
+    // the abort disposed its scope.
+    const oldsInOrder = [oldGenerationId, ...closure];
+    const stagedVersions = new Map<string, Map<string, string>>();
+    const prepared: { oldId: string; newId: string; pluginId: string; runTag: number }[] = [];
+    const providerPluginIds = new Map<string, Map<string, ReadonlyArray<string | null>>>();
+    for (const oldId of oldsInOrder) {
+      const pluginId = this.#pluginIdOf(oldId);
+      const itemRecord = this.plugins.get(pluginId);
+      if (itemRecord === undefined) {
+        throw new Error(`model: no plugin for generation ${oldId}`);
+      }
+      const itemDefinition = pluginId === definition.id ? definition : itemRecord.definition;
+      const itemRunTag = pluginId === definition.id ? runTag : itemRecord.runTag;
+      this.counter += 1;
+      const newId = `${pluginId}#${String(this.counter)}`;
+
+      const selections =
+        pluginId === definition.id
+          ? candidate.selections
+          : this.#rebindSelections(
+              itemDefinition,
+              oldId,
+              rangeCheck.dropped.get(oldId) ?? new Set<string>(),
+              stagedVersions,
+            );
+      providerPluginIds.set(
+        oldId,
+        new Map(
+          [...selections].map(([capabilityId, list]) => [
+            capabilityId,
+            list.map((selection) => selection.pluginId),
+          ]),
+        ),
+      );
+      // Setup effects, in engine order: acquire → require/optional (serve
+      // log) → contribute → provide. Serves resolve against the
+      // candidate's own selections.
+      this.#predictServes(itemDefinition, selections);
+
+      const failure = this.#preparationFailure(itemDefinition, oldId);
+      if (failure !== undefined) {
+        // Abort: candidates prepared so far are disposed; the olds were
+        // never withdrawn, so there is nothing to restore. The failing
+        // candidate kept its counter and its serve log entries.
+        return this.#replacementFailed(record, definition.id);
+      }
+      const staged = new Map<string, string>();
+      for (const provide of itemDefinition.provides) {
+        staged.set(provide.capabilityId, provide.version);
+      }
+      stagedVersions.set(pluginId, staged);
+      prepared.push({ oldId, newId, pluginId, runTag: itemRunTag });
+    }
+
+    // Synchronous commit. Capture the retired disposers' flags before the
+    // olds are withdrawn: a throwing disposer is inspectable on the retired
+    // plugin's record, but the replacement already succeeded and is never
+    // rolled back (INV-08/INV-14).
+    const oldDisposeThrows = new Map<string, boolean>();
+    for (const item of prepared) {
+      oldDisposeThrows.set(item.pluginId, this.genDisposeThrows.get(item.oldId) === true);
+    }
+    for (const item of prepared) {
+      this.#withdrawGeneration(item.oldId);
+    }
+    // Publish every candidate and re-record dependency edges before any
+    // event is emitted — provider-first, mirroring the engine.
+    for (const item of prepared) {
+      const itemRecord = this.plugins.get(item.pluginId);
+      if (itemRecord === undefined) {
+        throw new Error(`model: no plugin ${item.pluginId}`);
+      }
+      const itemDefinition = item.pluginId === definition.id ? definition : itemRecord.definition;
+      this.#publishRebindCandidate(
+        itemDefinition,
+        item,
+        providerPluginIds.get(item.oldId) ?? new Map(),
+      );
+    }
+    for (const item of prepared) {
+      this.events.push({ type: 'replaced', pluginId: item.pluginId, generation: item.newId });
+    }
+    // Only after a successful commit: retire the old scopes, dependents
+    // first (reverse provider-first order, mirroring cascade stop).
+    for (const item of [...prepared].reverse()) {
+      if (oldDisposeThrows.get(item.pluginId) === true) {
+        const itemRecord = this.plugins.get(item.pluginId);
+        if (itemRecord !== undefined) {
+          itemRecord.hasError = true;
+        }
+      }
     }
     return { ok: true };
+  }
+
+  /**
+   * A failed replacement: the replaced plugin's record carries the error,
+   * one `failed` event is emitted, and the old graph is untouched.
+   */
+  #replacementFailed(record: ModelPlugin, pluginId: string): ModelOutcome {
+    record.hasError = true;
+    this.events.push({ type: 'failed', pluginId });
+    return { ok: false, code: 'REPLACEMENT_FAILED' };
+  }
+
+  /**
+   * Mirrors `resolveCandidate`: the replacement candidate's requirements
+   * resolved against the currently published view. The old generation is
+   * intentionally present (it keeps serving), but the candidate cannot bind
+   * its own plugin id — that binding is withdrawn at commit.
+   */
+  #resolveCandidate(
+    definition: WorldPlugin,
+  ):
+    | { readonly ok: true; readonly selections: ModelProviderSelections }
+    | { readonly ok: false; readonly code: RuntimeErrorCode } {
+    const selections = new Map<string, readonly ModelSelection[]>();
+    for (const requirement of definition.requires) {
+      const pool: ModelSelection[] = [];
+      const cap = this.world.capabilities.find((entry) => entry.id === requirement.capabilityId);
+      if (cap?.host === true) {
+        pool.push({ pluginId: null, capabilityVersion: cap.hostVersion });
+      }
+      const byGeneration = this.published.get(requirement.capabilityId);
+      if (byGeneration !== undefined) {
+        for (const binding of byGeneration.values()) {
+          if (binding.pluginId === definition.id) {
+            continue;
+          }
+          pool.push({
+            pluginId: binding.pluginId,
+            capabilityVersion: binding.capabilityVersion,
+          });
+        }
+      }
+      const compatible = pool.filter((selection) =>
+        satisfiesRange(selection.capabilityVersion, requirement.range),
+      );
+      if (compatible.length === 0) {
+        if (requirement.optional) {
+          continue;
+        }
+        return {
+          ok: false,
+          code: pool.length === 0 ? 'MISSING_CAPABILITY' : 'INCOMPATIBLE_CAPABILITY',
+        };
+      }
+      if (compatible.length > 1 && !this.policyMultiple(requirement.capabilityId)) {
+        return { ok: false, code: 'AMBIGUOUS_PROVIDER' };
+      }
+      selections.set(requirement.capabilityId, sortSelections(compatible));
+    }
+    return { ok: true, selections };
+  }
+
+  /**
+   * The transitive active dependent closure of a generation, provider-first:
+   * BFS over dependents, then filtered through the activation order (which
+   * is topological — providers commit before their dependents).
+   */
+  #rebindClosure(oldGenerationId: string): string[] {
+    const seen = new Set<string>([oldGenerationId]);
+    const frontier = [oldGenerationId];
+    for (let index = 0; index < frontier.length; index += 1) {
+      const current = frontier[index];
+      if (current === undefined) {
+        break;
+      }
+      for (const dependent of this.#dependentsOfGeneration(current)) {
+        if (!seen.has(dependent)) {
+          seen.add(dependent);
+          frontier.push(dependent);
+        }
+      }
+    }
+    seen.delete(oldGenerationId);
+    return this.activationOrder.filter((generationId) => seen.has(generationId));
+  }
+
+  /**
+   * Mirrors `#checkDependentRanges`: every dependent's declared range
+   * against the rebound providers' versions — the candidate's staged
+   * versions for the replaced plugin, the published versions for rebound
+   * dependents. Returns, per old dependent generation id, the rebound
+   * provider generation ids whose binding is gone for it (dropped
+   * capability or unsatisfied optional range).
+   */
+  #checkDependentRanges(
+    definition: WorldPlugin,
+    oldGenerationId: string,
+    closure: readonly string[],
+  ):
+    | { readonly ok: true; readonly dropped: ReadonlyMap<string, ReadonlySet<string>> }
+    | { readonly ok: false } {
+    const versions = new Map<string, Map<string, string>>();
+    const staged = new Map<string, string>();
+    for (const provide of definition.provides) {
+      staged.set(provide.capabilityId, provide.version);
+    }
+    versions.set(oldGenerationId, staged);
+    for (const oldId of closure) {
+      const published = new Map<string, string>();
+      for (const [capabilityId, byGeneration] of this.published) {
+        const binding = byGeneration.get(oldId);
+        if (binding !== undefined) {
+          published.set(capabilityId, binding.capabilityVersion);
+        }
+      }
+      versions.set(oldId, published);
+    }
+    const reboundIds = new Set<string>([oldGenerationId, ...closure]);
+    const dropped = new Map<string, ReadonlySet<string>>();
+    for (const dependentOldId of closure) {
+      const dependentDropped = new Set<string>();
+      const { record: dependentRecord } = this.#ownerOf(dependentOldId);
+      const edges = this.genEdges.get(dependentOldId) ?? new Map<string, Set<string>>();
+      const ranges = this.genRanges.get(dependentOldId) ?? [];
+      for (const [capabilityId, providerIds] of edges) {
+        for (const providerId of providerIds) {
+          if (!reboundIds.has(providerId)) {
+            continue;
+          }
+          const version = versions.get(providerId)?.get(capabilityId);
+          const declared = ranges.find((entry) => entry.capabilityId === capabilityId);
+          const optional =
+            dependentRecord.definition.requires.find(
+              (requirement) => requirement.capabilityId === capabilityId,
+            )?.optional === true;
+          const mismatch =
+            version !== undefined &&
+            declared !== undefined &&
+            !satisfiesRange(version, declared.range);
+          if (version === undefined || mismatch) {
+            if (optional) {
+              dependentDropped.add(providerId);
+              continue;
+            }
+            return { ok: false }; // INCOMPATIBLE_CAPABILITY → REPLACEMENT_FAILED
+          }
+        }
+      }
+      dropped.set(dependentOldId, dependentDropped);
+    }
+    return { ok: true, dropped };
+  }
+
+  /**
+   * Mirrors `#rebindPlan`: the dependent's current provider topology,
+   * preserved selection-for-selection. A rebound provider whose binding is
+   * gone for this dependent contributes no selection, so `optional()`
+   * resolves `undefined`. Versions come from the transaction's staged
+   * provides first (candidates prepared earlier, provider-first), then the
+   * published view.
+   */
+  #rebindSelections(
+    definition: WorldPlugin,
+    oldId: string,
+    droppedProviders: ReadonlySet<string>,
+    stagedVersions: ReadonlyMap<string, ReadonlyMap<string, string>>,
+  ): ModelProviderSelections {
+    const selections = new Map<string, readonly ModelSelection[]>();
+    const edges = this.genEdges.get(oldId) ?? new Map<string, Set<string>>();
+    for (const requirement of definition.requires) {
+      const capabilityId = requirement.capabilityId;
+      const list: ModelSelection[] = [];
+      for (const providerGenerationId of edges.get(capabilityId) ?? []) {
+        if (droppedProviders.has(providerGenerationId)) {
+          continue;
+        }
+        const providerPluginId = this.#pluginIdOf(providerGenerationId);
+        const version =
+          stagedVersions.get(providerPluginId)?.get(capabilityId) ??
+          this.published.get(capabilityId)?.get(providerGenerationId)?.capabilityVersion;
+        if (version === undefined) {
+          continue; // the provider went away mid-transaction; require() fails loudly
+        }
+        list.push({ pluginId: providerPluginId, capabilityVersion: version });
+      }
+      selections.set(capabilityId, list);
+    }
+    return selections;
+  }
+
+  /**
+   * Mirrors the failure half of `#prepareGeneration` for one rebind
+   * candidate: setup effects already ran (serves logged above); the
+   * declared-publish check and the staged-conflict check (shadowing the
+   * generation being replaced) decide success. Returns the failure code,
+   * or undefined when preparation succeeds.
+   */
+  #preparationFailure(definition: WorldPlugin, shadowedId: string): RuntimeErrorCode | undefined {
+    if (definition.failSetupThrow) {
+      return 'ACTIVATION_FAILED';
+    }
+    if (definition.failPublish && definition.provides.length > 0) {
+      return 'ACTIVATION_FAILED';
+    }
+    for (const provide of definition.provides) {
+      if (this.policyMultiple(provide.capabilityId)) {
+        continue;
+      }
+      const byGeneration = this.published.get(provide.capabilityId);
+      if (byGeneration !== undefined) {
+        for (const otherGeneration of byGeneration.keys()) {
+          if (otherGeneration !== shadowedId) {
+            return 'AMBIGUOUS_PROVIDER';
+          }
+        }
+      }
+    }
+    for (const keyId of definition.contributions) {
+      const byGeneration = this.contributions.get(keyId);
+      if (byGeneration !== undefined) {
+        for (const otherGeneration of byGeneration.keys()) {
+          if (otherGeneration !== shadowedId) {
+            return 'ACTIVATION_FAILED';
+          }
+        }
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Publishes one committed rebind candidate: staged provides, staged
+   * contributions, dependency edges (resolved against the current published
+   * view, exactly like the engine's `#recordResolvedProviders`), and the
+   * record swap. The caller withdraws every old generation first, so the
+   * swap is atomic.
+   */
+  #publishRebindCandidate(
+    definition: WorldPlugin,
+    item: { oldId: string; newId: string; pluginId: string; runTag: number },
+    providerPluginIds: ReadonlyMap<string, ReadonlyArray<string | null>>,
+  ): void {
+    const record = this.plugins.get(item.pluginId);
+    if (record === undefined) {
+      throw new Error(`model: no plugin ${item.pluginId}`);
+    }
+    for (const provide of definition.provides) {
+      let byGeneration = this.published.get(provide.capabilityId);
+      if (byGeneration === undefined) {
+        byGeneration = new Map<string, ModelSelection>();
+        this.published.set(provide.capabilityId, byGeneration);
+      }
+      byGeneration.set(item.newId, {
+        pluginId: item.pluginId,
+        capabilityVersion: provide.version,
+      });
+    }
+    for (const keyId of definition.contributions) {
+      let byGeneration = this.contributions.get(keyId);
+      if (byGeneration === undefined) {
+        byGeneration = new Map<string, { pluginId: string; valueRef: string }>();
+        this.contributions.set(keyId, byGeneration);
+      }
+      byGeneration.set(item.newId, {
+        pluginId: item.pluginId,
+        valueRef: `${item.pluginId}|${keyId}|${item.runTag}`,
+      });
+    }
+    const edges = new Map<string, Set<string>>();
+    for (const requirement of definition.requires) {
+      const capabilityId = requirement.capabilityId;
+      const providers = new Set<string>();
+      for (const providerPluginId of providerPluginIds.get(capabilityId) ?? []) {
+        if (providerPluginId === null) {
+          continue; // host providers are never stop/replace targets
+        }
+        const byGeneration = this.published.get(capabilityId);
+        if (byGeneration === undefined) {
+          continue;
+        }
+        for (const [providerGenerationId, binding] of byGeneration) {
+          if (binding.pluginId === providerPluginId) {
+            providers.add(providerGenerationId);
+            break;
+          }
+        }
+      }
+      edges.set(capabilityId, providers);
+    }
+    this.genEdges.set(item.newId, edges);
+    this.genRanges.set(
+      item.newId,
+      definition.requires.map((requirement) => ({
+        capabilityId: requirement.capabilityId,
+        range: requirement.range,
+      })),
+    );
+    this.genResources.set(item.newId, definition.resources);
+    this.genDisposeThrows.set(item.newId, definition.failDisposerThrow);
+    this.activationOrder.push(item.newId);
+    record.definition = definition;
+    record.runTag = item.runTag;
+    record.generation = item.newId;
+    record.hasError = false;
+    record.status = 'active';
   }
 
   uninstall(id: string): ModelOutcome {
@@ -408,10 +838,11 @@ export class ModelRuntime {
       });
     }
     // Dependency edges recorded at commit from the resolution plan.
-    const consumes = new Set<string>();
+    const edges = new Map<string, Set<string>>();
     for (const requirement of definition.requires) {
       const selections =
         resolution.providers.get(definition.id)?.get(requirement.capabilityId) ?? [];
+      const providers = new Set<string>();
       for (const selection of selections) {
         if (selection.pluginId === null) {
           continue; // host providers are never stop/replace targets
@@ -422,13 +853,21 @@ export class ModelRuntime {
         }
         for (const [providerGenerationId, binding] of byGeneration) {
           if (binding.pluginId === selection.pluginId) {
-            consumes.add(providerGenerationId);
+            providers.add(providerGenerationId);
             break;
           }
         }
       }
+      edges.set(requirement.capabilityId, providers);
     }
-    this.genConsumes.set(generationId, consumes);
+    this.genEdges.set(generationId, edges);
+    this.genRanges.set(
+      generationId,
+      definition.requires.map((requirement) => ({
+        capabilityId: requirement.capabilityId,
+        range: requirement.range,
+      })),
+    );
     this.genResources.set(generationId, definition.resources);
     this.genDisposeThrows.set(generationId, definition.failDisposerThrow);
     record.status = 'active';
@@ -439,193 +878,17 @@ export class ModelRuntime {
     return { ok: true, generationId };
   }
 
-  /**
-   * Mirrors the engine's candidate preparation: serves resolve
-   * against current published bindings (the old generation serves), conflicts
-   * are checked against every generation except the one being replaced.
-   */
-  #candidateSelections(definition: WorldPlugin): ModelProviderSelections {
-    const currentProviders = new Map<string, readonly ModelSelection[]>();
-    for (const requirement of definition.requires) {
-      const pool: ModelSelection[] = [];
-      const cap = this.world.capabilities.find((entry) => entry.id === requirement.capabilityId);
-      if (cap?.host === true) {
-        pool.push({ pluginId: null, capabilityVersion: cap.hostVersion });
-      }
-      const byGeneration = this.published.get(requirement.capabilityId);
-      if (byGeneration !== undefined) {
-        for (const binding of byGeneration.values()) {
-          if (binding.pluginId === definition.id) {
-            // Candidate resolution cannot depend on the old generation it is
-            // replacing; the old binding is withdrawn at commit.
-            continue;
-          }
-          pool.push({
-            pluginId: binding.pluginId,
-            capabilityVersion: binding.capabilityVersion,
-          });
-        }
-      }
-      const compatible = pool.filter((candidate) =>
-        satisfiesRange(candidate.capabilityVersion, requirement.range),
-      );
-      const ordered = compatible.sort((a, b) => {
-        if (a.pluginId === null) {
-          return b.pluginId === null ? 0 : -1;
-        }
-        if (b.pluginId === null) {
-          return 1;
-        }
-        return a.pluginId < b.pluginId ? -1 : a.pluginId > b.pluginId ? 1 : 0;
-      });
-      currentProviders.set(requirement.capabilityId, ordered);
-    }
-    return currentProviders;
-  }
-
-  #prepareCandidate(
-    definition: WorldPlugin,
-    oldGenerationId: string,
-    currentProviders: ModelProviderSelections,
-  ): ModelOutcome | undefined {
-    // Serves resolve against current compatible bindings — host first, then
-    // plugin id lexicographic (the old generation remains authoritative).
-    this.#predictServes(definition, currentProviders);
-
-    if (definition.failSetupThrow) {
-      return { ok: false, code: 'ACTIVATION_FAILED' };
-    }
-
-    for (const requirement of definition.requires) {
-      const selections = currentProviders.get(requirement.capabilityId) ?? [];
-      if (selections.length === 0 && !requirement.optional) {
-        const pool = this.#providerPool(requirement.capabilityId);
-        if (pool.length === 0) {
-          return { ok: false, code: 'MISSING_CAPABILITY' };
-        }
-        return {
-          ok: false,
-          code: pool.some((candidate) =>
-            satisfiesRange(candidate.capabilityVersion, requirement.range),
-          )
-            ? 'MISSING_CAPABILITY'
-            : 'INCOMPATIBLE_CAPABILITY',
-        };
-      }
-      if (selections.length > 1 && !this.policyMultiple(requirement.capabilityId)) {
-        return { ok: false, code: 'AMBIGUOUS_PROVIDER' };
-      }
-    }
-
-    if (definition.failPublish && definition.provides.length > 0) {
-      return { ok: false, code: 'ACTIVATION_FAILED' };
-    }
-    for (const provide of definition.provides) {
-      if (this.policyMultiple(provide.capabilityId)) {
-        continue;
-      }
-      const byGeneration = this.published.get(provide.capabilityId);
-      if (byGeneration === undefined) {
-        continue;
-      }
-      for (const otherGeneration of byGeneration.keys()) {
-        if (otherGeneration !== oldGenerationId) {
-          return { ok: false, code: 'AMBIGUOUS_PROVIDER' };
-        }
-      }
-    }
-    for (const keyId of definition.contributions) {
-      const byGeneration = this.contributions.get(keyId);
-      if (byGeneration === undefined) {
-        continue;
-      }
-      for (const otherGeneration of byGeneration.keys()) {
-        if (otherGeneration !== oldGenerationId) {
-          return { ok: false, code: 'ACTIVATION_FAILED' };
-        }
-      }
-    }
-    return undefined;
-  }
-
-  /**
-   * Candidate consumes, computed from current bindings (engine order: the old
-   * generation is still published when its successor records its edges).
-   */
-  #candidateConsumes(
-    definition: WorldPlugin,
-    currentProviders: ModelProviderSelections,
-  ): Set<string> {
-    const consumes = new Set<string>();
-    for (const requirement of definition.requires) {
-      const selections = currentProviders.get(requirement.capabilityId) ?? [];
-      const byGeneration = this.published.get(requirement.capabilityId);
-      if (byGeneration === undefined) {
-        continue;
-      }
-      for (const selection of selections) {
-        if (selection.pluginId === null) {
-          continue;
-        }
-        for (const [providerGenerationId, binding] of byGeneration) {
-          if (binding.pluginId === selection.pluginId) {
-            consumes.add(providerGenerationId);
-            break;
-          }
-        }
-      }
-    }
-    return consumes;
-  }
-
-  #providerPool(capabilityId: string): readonly ModelSelection[] {
-    const pool: ModelSelection[] = [];
-    const cap = this.world.capabilities.find((entry) => entry.id === capabilityId);
-    if (cap?.host === true) {
-      pool.push({ pluginId: null, capabilityVersion: cap.hostVersion });
-    }
-    for (const binding of this.published.get(capabilityId)?.values() ?? []) {
-      pool.push({ pluginId: binding.pluginId, capabilityVersion: binding.capabilityVersion });
-    }
-    return pool;
-  }
-
-  #publishCandidate(
-    definition: WorldPlugin,
-    runTag: number,
-    candidateId: string,
-    consumes: Set<string>,
-  ): void {
-    this.genConsumes.set(candidateId, consumes);
-    this.genResources.set(candidateId, definition.resources);
-    this.genDisposeThrows.set(candidateId, definition.failDisposerThrow);
-    for (const provide of definition.provides) {
-      let byGeneration = this.published.get(provide.capabilityId);
-      if (byGeneration === undefined) {
-        byGeneration = new Map<string, ModelSelection>();
-        this.published.set(provide.capabilityId, byGeneration);
-      }
-      byGeneration.set(candidateId, {
-        pluginId: definition.id,
-        capabilityVersion: provide.version,
-      });
-    }
-    for (const keyId of definition.contributions) {
-      let byGeneration = this.contributions.get(keyId);
-      if (byGeneration === undefined) {
-        byGeneration = new Map<string, { pluginId: string; valueRef: string }>();
-        this.contributions.set(keyId, byGeneration);
-      }
-      byGeneration.set(candidateId, {
-        pluginId: definition.id,
-        valueRef: `${definition.id}|${keyId}|${runTag}`,
-      });
-    }
-    this.activationOrder.push(candidateId);
-  }
-
   // -- resolution (mirrored) ------------------------------------------
 
+  /**
+   * Mirrors `resolve`: the requirement fixpoint walks only the selected
+   * closure from the root (a broken requirement on a definition nobody
+   * selects cannot poison this activation), and provider selection is
+   * tiered — active providers win, stopped providers are revived only when
+   * no tier-1 candidate satisfies the requirement. The topological order
+   * comes from Kahn over the selected closure with a lexicographic ready
+   * set; a cycle leaves nodes unconsumed.
+   */
   #resolve(root: string):
     | {
         readonly ok: true;
@@ -634,54 +897,67 @@ export class ModelRuntime {
       }
     | { readonly ok: false; readonly code: RuntimeErrorCode } {
     const byId = new Map<string, WorldPlugin>();
-    for (const [id, record] of this.plugins) {
-      byId.set(id, record.definition);
-    }
     const statuses = new Map<string, ModelStatus>();
     for (const [id, record] of this.plugins) {
+      byId.set(id, record.definition);
       statuses.set(id, record.status);
     }
 
-    // Candidate pool: host providers plus every definition declaring the token.
-    const candidates = new Map<string, ModelSelection[]>();
+    // Candidate pool: host providers plus every installed definition
+    // declaring the token, each tagged with its selection tier. The root is
+    // always tier 1; stopped definitions are tier 2.
+    const candidates = new Map<string, ModelCandidate[]>();
+    const addCandidate = (capabilityId: string, candidate: ModelCandidate): void => {
+      const list = candidates.get(capabilityId);
+      if (list === undefined) {
+        candidates.set(capabilityId, [candidate]);
+      } else {
+        list.push(candidate);
+      }
+    };
     for (const cap of this.world.capabilities) {
       if (cap.host) {
-        const list = candidates.get(cap.id) ?? [];
-        list.push({ pluginId: null, capabilityVersion: cap.hostVersion });
-        candidates.set(cap.id, list);
+        addCandidate(cap.id, { pluginId: null, capabilityVersion: cap.hostVersion, tier: 1 });
       }
     }
     for (const definition of byId.values()) {
+      const tier: 1 | 2 =
+        definition.id === root || statuses.get(definition.id) !== 'stopped' ? 1 : 2;
       for (const provide of definition.provides) {
-        const list = candidates.get(provide.capabilityId) ?? [];
-        list.push({
+        addCandidate(provide.capabilityId, {
           pluginId: definition.id,
           capabilityVersion: provide.version,
+          tier,
         });
-        candidates.set(provide.capabilityId, list);
       }
     }
 
+    // Requirement fixpoint over the selected closure, lexicographic
+    // worklist — starting from the root, select providers for every
+    // requirement in declared order.
     const selection = new Map<string, Map<string, readonly ModelSelection[]>>();
-    for (const definition of [...byId.values()].sort((a, b) =>
-      a.id < b.id ? -1 : a.id > b.id ? 1 : 0,
-    )) {
+    const selected = new Set<string>([root]);
+    const worklist: string[] = [root];
+    let node = worklist.shift();
+    while (node !== undefined) {
+      const definition = byId.get(node);
+      if (definition === undefined) {
+        throw new Error(`model: worklist referenced unknown plugin ${node}`);
+      }
       for (const requirement of definition.requires) {
         const capabilityId = requirement.capabilityId;
-        const range = requirement.range;
         const pool = candidates.get(capabilityId) ?? [];
         const compatible = pool.filter((candidate) =>
-          satisfiesRange(candidate.capabilityVersion, range),
+          satisfiesRange(candidate.capabilityVersion, requirement.range),
         );
-        const selectable = compatible.filter((candidate) => {
-          if (candidate.pluginId === null) {
-            return true;
-          }
-          return statuses.get(candidate.pluginId) !== 'stopped';
-        });
+        // Tiered selection: active providers win; stopped providers are
+        // revived only when no tier-1 candidate satisfies the requirement.
+        const tier1 = compatible.filter((candidate) => candidate.tier === 1);
+        const tier2 = compatible.filter((candidate) => candidate.tier === 2);
+        const selectable = tier1.length > 0 ? tier1 : tier2;
         if (selectable.length === 0) {
           if (requirement.optional) {
-            continue; // visibility without failure; the model keeps no diagnostics
+            continue; // visibility without failure
           }
           if (pool.length === 0) {
             return { ok: false, code: 'MISSING_CAPABILITY' };
@@ -689,127 +965,85 @@ export class ModelRuntime {
           if (compatible.length === 0) {
             return { ok: false, code: 'INCOMPATIBLE_CAPABILITY' };
           }
-          return { ok: false, code: 'MISSING_CAPABILITY' }; // every provider stopped
+          // Selectable is empty while compatible is not: every compatible
+          // candidate is stopped and tier-1 already lost — unreachable when
+          // tier-1 exists, so this is a defensive fallback.
+          return { ok: false, code: 'MISSING_CAPABILITY' };
         }
         if (selectable.length > 1 && !this.policyMultiple(capabilityId)) {
           return { ok: false, code: 'AMBIGUOUS_PROVIDER' };
         }
-        const ordered = [...selectable].sort((a, b) => {
-          if (a.pluginId === null) {
-            return b.pluginId === null ? 0 : -1;
-          }
-          if (b.pluginId === null) {
-            return 1;
-          }
-          return a.pluginId < b.pluginId ? -1 : a.pluginId > b.pluginId ? 1 : 0;
-        });
+        const ordered = sortSelections(selectable);
         let consumerSelection = selection.get(definition.id);
         if (consumerSelection === undefined) {
           consumerSelection = new Map<string, readonly ModelSelection[]>();
           selection.set(definition.id, consumerSelection);
         }
-        consumerSelection.set(capabilityId, ordered);
+        consumerSelection.set(
+          capabilityId,
+          ordered.map((candidate) => ({
+            pluginId: candidate.pluginId,
+            capabilityVersion: candidate.capabilityVersion,
+          })),
+        );
+        for (const candidate of ordered) {
+          if (candidate.pluginId !== null && !selected.has(candidate.pluginId)) {
+            selected.add(candidate.pluginId);
+            worklist.push(candidate.pluginId);
+            worklist.sort();
+          }
+        }
       }
+      node = worklist.shift();
     }
 
-    // Selected edges only; a global cycle check in sorted-start order.
-    const adjacency = new Map<string, string[]>();
-    for (const [from, consumerSelections] of selection) {
-      for (const selections of consumerSelections.values()) {
-        for (const candidate of selections) {
-          const to = candidate.pluginId ?? '(host)';
-          const list = adjacency.get(from) ?? [];
-          list.push(to);
-          adjacency.set(from, list);
-        }
-      }
-    }
-    const UNVISITED = 0;
-    const VISITING = 1;
-    const DONE = 2;
-    const marks = new Map<string, number>();
-    for (const id of byId.keys()) {
-      marks.set(id, UNVISITED);
-    }
-    let cycle = false;
-    const visit = (node: string): void => {
-      const mark = marks.get(node);
-      if (mark === VISITING) {
-        cycle = true;
-        return;
-      }
-      if (mark === DONE || cycle) {
-        return;
-      }
-      marks.set(node, VISITING);
-      for (const next of adjacency.get(node) ?? []) {
-        if (next === '(host)') {
-          continue;
-        }
-        visit(next);
-        if (cycle) {
-          return;
-        }
-      }
-      marks.set(node, DONE);
-    };
-    for (const id of [...byId.keys()].sort()) {
-      visit(id);
-      if (cycle) {
-        return { ok: false, code: 'DEPENDENCY_CYCLE' };
-      }
-    }
-
-    // Closure of the root over requirement edges, then Kahn with a sorted
-    // ready set.
-    const closure = new Set<string>([root]);
-    const collect = (node: string): void => {
-      for (const next of adjacency.get(node) ?? []) {
-        if (next === '(host)' || closure.has(next)) {
-          continue;
-        }
-        closure.add(next);
-        collect(next);
-      }
-    };
-    collect(root);
-
+    // Kahn topological order over the selected closure with a
+    // lexicographic ready set — providers before consumers. A dependency
+    // cycle leaves nodes unconsumed.
     const inDegree = new Map<string, number>();
     const dependentsOf = new Map<string, string[]>();
-    for (const node of closure) {
+    for (const id of selected) {
       const deps = new Set<string>();
-      for (const next of adjacency.get(node) ?? []) {
-        if (closure.has(next) && next !== node) {
-          deps.add(next);
+      for (const selections of selection.get(id)?.values() ?? []) {
+        for (const candidate of selections) {
+          if (
+            candidate.pluginId !== null &&
+            candidate.pluginId !== id &&
+            selected.has(candidate.pluginId)
+          ) {
+            deps.add(candidate.pluginId);
+          }
         }
       }
-      inDegree.set(node, deps.size);
+      inDegree.set(id, deps.size);
       for (const dep of deps) {
-        const list = dependentsOf.get(dep) ?? [];
-        list.push(node);
-        dependentsOf.set(dep, list);
+        const list = dependentsOf.get(dep);
+        if (list === undefined) {
+          dependentsOf.set(dep, [id]);
+        } else {
+          list.push(id);
+        }
       }
     }
-    const ready = [...closure].filter((node) => (inDegree.get(node) ?? 0) === 0).sort();
+    const ready = [...selected].filter((id) => (inDegree.get(id) ?? 0) === 0).sort();
     const order: string[] = [];
     while (ready.length > 0) {
-      const node = ready.shift();
-      if (node === undefined) {
+      const next = ready.shift();
+      if (next === undefined) {
         break;
       }
-      order.push(node);
-      for (const dependent of dependentsOf.get(node) ?? []) {
-        const current = inDegree.get(dependent);
-        if (current === undefined) {
-          continue;
-        }
-        const remaining = current - 1;
+      order.push(next);
+      for (const dependent of dependentsOf.get(next) ?? []) {
+        const remaining = (inDegree.get(dependent) ?? 0) - 1;
         inDegree.set(dependent, remaining);
         if (remaining === 0) {
           ready.push(dependent);
+          ready.sort();
         }
       }
-      ready.sort();
+    }
+    if (order.length !== selected.size) {
+      return { ok: false, code: 'DEPENDENCY_CYCLE' };
     }
     return { ok: true, order, providers: selection };
   }
@@ -818,25 +1052,35 @@ export class ModelRuntime {
 
   /** Active dependents of a generation, in activation order (engine #activeDependentsOf). */
   #dependentsOfGeneration(providerGenerationId: string): string[] {
-    const hash = providerGenerationId.indexOf('#');
-    const providerPluginId = hash >= 0 ? providerGenerationId.slice(0, hash) : providerGenerationId;
+    const providerPluginId = this.#pluginIdOf(providerGenerationId);
     const dependents: string[] = [];
     for (const generationId of this.activationOrder) {
-      const owner = this.#ownerOf(generationId);
-      if (owner.id === providerPluginId) {
+      if (this.#pluginIdOf(generationId) === providerPluginId) {
         continue;
       }
-      if (this.genConsumes.get(generationId)?.has(providerGenerationId) === true) {
-        dependents.push(generationId);
+      const edges = this.genEdges.get(generationId);
+      if (edges === undefined) {
+        continue;
+      }
+      for (const providers of edges.values()) {
+        if (providers.has(providerGenerationId)) {
+          dependents.push(generationId);
+          break;
+        }
       }
     }
     return dependents;
   }
 
+  /** The plugin id owning a generation id (`pluginId#counter`). */
+  #pluginIdOf(generationId: string): string {
+    const hash = generationId.indexOf('#');
+    return hash >= 0 ? generationId.slice(0, hash) : generationId;
+  }
+
   /** The plugin record owning a generation id (`pluginId#counter`). */
   #ownerOf(generationId: string): { readonly record: ModelPlugin; readonly id: string } {
-    const hash = generationId.indexOf('#');
-    const pluginId = hash >= 0 ? generationId.slice(0, hash) : generationId;
+    const pluginId = this.#pluginIdOf(generationId);
     const record = this.plugins.get(pluginId);
     if (record === undefined) {
       throw new Error(`model: no plugin for generation ${generationId}`);
@@ -844,7 +1088,7 @@ export class ModelRuntime {
     return { record, id: pluginId };
   }
 
-  /** Pure state cleanup — publications, contributions, ordering, resources. */
+  /** Pure state cleanup — publications, contributions, ordering, resources, edges. */
   #withdrawGeneration(generationId: string): void {
     for (const [capabilityId, byGeneration] of this.published) {
       if (byGeneration.delete(generationId) && byGeneration.size === 0) {
@@ -861,6 +1105,8 @@ export class ModelRuntime {
       this.activationOrder.splice(orderIndex, 1);
     }
     this.genResources.delete(generationId);
+    this.genEdges.delete(generationId);
+    this.genRanges.delete(generationId);
     this.genDisposeThrows.delete(generationId);
   }
 
@@ -868,8 +1114,8 @@ export class ModelRuntime {
    * Predicts the serve log of one setup: every declared requirement resolved
    * in declared order, tagged with who served it (host or provider plugin id,
    * comma-joined for multi tokens). `providers` is the plan selection for the
-   * start path and the current-binding list for the candidate path — both are
-   * read the same way.
+   * start path, the candidate selections for the replace path, and the
+   * preserved topology for rebound dependents — all read the same way.
    */
   #predictServes(definition: WorldPlugin, providers: ModelProviderSelections): void {
     if (!definition.doRequire) {
@@ -888,4 +1134,21 @@ export class ModelRuntime {
       });
     }
   }
+}
+
+/**
+ * Documented selection order: host providers first, then plugin id
+ * lexicographic. Shared by the start path, the candidate path, and the
+ * serve-log prediction.
+ */
+function sortSelections<T extends ModelSelection>(selections: readonly T[]): T[] {
+  return [...selections].sort((a, b) => {
+    if (a.pluginId === null) {
+      return b.pluginId === null ? 0 : -1;
+    }
+    if (b.pluginId === null) {
+      return 1;
+    }
+    return a.pluginId < b.pluginId ? -1 : a.pluginId > b.pluginId ? 1 : 0;
+  });
 }

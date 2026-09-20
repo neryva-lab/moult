@@ -416,7 +416,7 @@ export type Operation =
   | { readonly type: 'install'; readonly id: string }
   | { readonly type: 'start'; readonly id: string }
   | { readonly type: 'stop'; readonly id: string; readonly cascade: boolean }
-  | { readonly type: 'replace'; readonly id: string }
+  | { readonly type: 'replace'; readonly id: string; readonly strict: boolean }
   | { readonly type: 'uninstall'; readonly id: string }
   | { readonly type: 'dispose' };
 
@@ -443,7 +443,11 @@ export function arbOperations(world: World): fc.Arbitrary<readonly Operation[]> 
     },
     {
       weight: 2,
-      arbitrary: fc.record({ type: fc.constant('replace' as const), id: fc.constantFrom(...ids) }),
+      arbitrary: fc.record({
+        type: fc.constant('replace' as const),
+        id: fc.constantFrom(...ids),
+        strict: fc.boolean(),
+      }),
     },
     {
       weight: 2,

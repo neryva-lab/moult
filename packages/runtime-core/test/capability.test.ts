@@ -33,14 +33,18 @@ describe('capability factory', () => {
     expectInvalidDefinition(() => capability('a..b', '1.0.0'));
     expectInvalidDefinition(() => capability('.leading.dot', '1.0.0'));
     expectInvalidDefinition(() => capability('', '1.0.0'));
-    expectInvalidDefinition(() => capability('a-b.c', '1.0.0')); // hyphens only in non-first segments
+    expectInvalidDefinition(() => capability('-leading.hyphen', '1.0.0')); // must start with a letter
   });
 
   it('accepts the documented id shapes', () => {
     expect(capability('a', '1.0.0').id).toBe('a');
     expect(capability('example.clock', '1.0.0').id).toBe('example.clock');
     expect(capability('a1.b2-c3', '1.0.0').id).toBe('a1.b2-c3');
-    expect(capability('a.b-c', '1.0.0').id).toBe('a.b-c'); // hyphens allowed in non-first segments
+    expect(capability('a.b-c', '1.0.0').id).toBe('a.b-c');
+    // F16: hyphens are allowed in every segment, including the first —
+    // 'memory-storage' (the README headline example) is a valid id.
+    expect(capability('a-b.c', '1.0.0').id).toBe('a-b.c');
+    expect(capability('memory-storage', '1.0.0').id).toBe('memory-storage');
   });
 
   it('rejects versions that are not valid semver', () => {
