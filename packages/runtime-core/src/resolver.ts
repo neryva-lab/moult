@@ -304,8 +304,7 @@ export function resolve(input: ResolutionInput): ResolutionPlan {
         satisfiesRange(candidate.capabilityVersion, range),
       );
       // Tiered selection: active providers win; stopped providers are
-      // revived only when no tier-1 candidate satisfies the requirement;
-      // lazy providers never win implicitly.
+      // revived only when no tier-1 candidate satisfies the requirement.
       const tier1 = compatible.filter((candidate) => candidate.tier === 1);
       const tier2 = compatible.filter((candidate) => candidate.tier === 2);
       const selectable = tier1.length > 0 ? tier1 : tier2;
@@ -347,15 +346,6 @@ export function resolve(input: ResolutionInput): ResolutionPlan {
             details: { blocked: [diagnostic()] },
           });
         }
-        // Selectable is empty while compatible is not: every compatible
-        // candidate is lazy, so nothing can be chosen implicitly.
-        throw new MoltError({
-          code: 'MISSING_CAPABILITY',
-          message: `every provider of ${capabilityId} is lazy; start one explicitly`,
-          pluginId: definition.id,
-          capabilityId,
-          details: { blocked: [diagnostic()] },
-        });
       }
 
       if (selectable.length > 1 && requirement.capability.multiple !== true) {

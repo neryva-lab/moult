@@ -109,6 +109,54 @@ describe('configuration', () => {
     expect(seen[1]).toEqual({ a: 10, b: 2, c: 10 });
     await runtime.dispose();
   });
+
+  it('rejects a non-record install config', () => {
+    const runtime = createRuntime();
+    const definition: PluginDefinition = {
+      id: 'test.configshape',
+      version: '1.0.0',
+      setup: () => {},
+    };
+    for (const bad of ['nope', 42, ['a'], null]) {
+      expect(() =>
+        runtime.install(definition, { config: bad as unknown as Record<string, unknown> }),
+      ).toThrowError(expect.objectContaining({ code: 'INVALID_DEFINITION' }));
+    }
+    expect(runtime.getStatus('test.configshape')).toBeUndefined();
+  });
+
+  it('hands validateConfig a frozen merged config', () => {
+    const runtime = createRuntime();
+    const seen: boolean[] = [];
+    const definition: PluginDefinition = {
+      id: 'test.frozenvalidate',
+      version: '1.0.0',
+      config: { a: 1 },
+      validateConfig: (config) => {
+        seen.push(Object.isFrozen(config));
+        return [];
+      },
+      setup: () => {},
+    };
+    runtime.install(definition, { config: { b: 2 } });
+    expect(seen).toEqual([true]);
+    // A failed updateConfig also validates the frozen merge and changes nothing.
+    const seen2: boolean[] = [];
+    const strict: PluginDefinition = {
+      id: 'test.frozenvalidate2',
+      version: '1.0.0',
+      validateConfig: (config) => {
+        seen2.push(Object.isFrozen(config));
+        return (config['n'] as number) > 1 ? ['too big'] : [];
+      },
+      setup: () => {},
+    };
+    runtime.install(strict, { config: { n: 1 } });
+    expect(() => runtime.updateConfig('test.frozenvalidate2', { n: 2 })).toThrowError(
+      expect.objectContaining({ code: 'INVALID_STATE' }),
+    );
+    expect(seen2).toEqual([true, true]);
+  });
 });
 
 describe('lifecycle timeouts', () => {

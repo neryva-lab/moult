@@ -290,7 +290,10 @@ function resolveConfig(
     ...(definition.config ?? {}),
     ...overrides,
   };
-  const errors = definition.validateConfig?.(merged) ?? [];
+  // Frozen before validation: a throwing or mutating validateConfig cannot
+  // corrupt the object the runtime is about to publish as ctx.config.
+  const frozenMerged = Object.freeze(merged);
+  const errors = definition.validateConfig?.(frozenMerged) ?? [];
   if (errors.length > 0) {
     throw new MoltError({
       code,
@@ -299,7 +302,7 @@ function resolveConfig(
       details: { reason: 'invalid-config', errors: [...errors] },
     });
   }
-  return Object.freeze(merged);
+  return frozenMerged;
 }
 
 interface PublishedBinding {
@@ -575,7 +578,19 @@ class RuntimeImpl implements Runtime {
         pluginId: definition.id,
       });
     }
-    const overrides: Record<string, unknown> = { ...(options?.config ?? {}) };
+    const rawConfig = options?.config;
+    if (
+      rawConfig !== undefined &&
+      (typeof rawConfig !== 'object' || rawConfig === null || Array.isArray(rawConfig))
+    ) {
+      throw new MoltError({
+        code: 'INVALID_DEFINITION',
+        message: `install options config for plugin ${definition.id} must be a record`,
+        pluginId: definition.id,
+        details: { reason: 'invalid-config' },
+      });
+    }
+    const overrides: Record<string, unknown> = { ...(rawConfig ?? {}) };
     const frozen = freezeDefinition(definition);
     const effectiveConfig = resolveConfig(frozen, overrides, 'INVALID_DEFINITION');
     this.#plugins.set(definition.id, {
@@ -1352,7 +1367,10 @@ class RuntimeImpl implements Runtime {
     if (result === undefined || typeof result !== 'object' || typeof result.ok !== 'boolean') {
       return { ok: false, message: 'health check returned a malformed result' };
     }
-    return { ok: result.ok, message: result.message };
+    return {
+      ok: result.ok,
+      message: typeof result.message === 'string' ? result.message : undefined,
+    };
   }
 
   /**
@@ -1743,11 +1761,101 @@ class RuntimeImpl implements Runtime {
           oldContributions: Map<string, ContributionEntry>;
         }[]
       | undefined;
+    // Ownership spans the whole transaction — preparation, health gate,
+    // commit, and retirement. Releasing it before the health gate would let
+    // a concurrent stop/updateConfig/replace interleave with the awaited
+    // probes and corrupt the commit or the rollback.
     try {
-      // The provider candidate prepares first: range checks and dependent
-      // plans need its staged provides.
-      const providerItem = items[0];
-      if (providerItem === undefined || providerItem.plan === undefined) {
+      try {
+        // The provider candidate prepares first: range checks and dependent
+        // plans need its staged provides.
+        const providerItem = items[0];
+        if (providerItem === undefined || providerItem.plan === undefined) {
+          throw new MoltError({
+            code: 'INVALID_STATE',
+            message: 'rebind transaction is internally inconsistent',
+            pluginId: definition.id,
+            details: { reason: 'transaction-corrupt' },
+          });
+        }
+        providerItem.prepared = await this.#prepareGeneration(
+          providerItem.definition,
+          providerItem.plan,
+          {
+            shadowed: providerItem.old,
+            rebindOverlay: overlay,
+            effectiveConfig: newEffectiveConfig,
+            setupMs: timeouts.setupMs,
+          },
+        );
+        prepared.push(providerItem.prepared);
+        this.#stageRebindBindings(providerItem.prepared, overlay);
+
+        // Every dependent's declared range must still be satisfied by the
+        // rebound providers. Optional requirements the candidate no longer
+        // satisfies bind nothing instead of failing the transaction.
+        const droppedByDependent = this.#checkDependentRanges(
+          oldsInOrder,
+          reboundIds,
+          providerItem.prepared.stagedProvides,
+          definition.id,
+        );
+
+        for (const item of items.slice(1)) {
+          const plan = this.#rebindPlan(
+            item.old,
+            item.definition,
+            droppedByDependent.get(item.old.id) ?? new Set<string>(),
+            reboundIds,
+            overlay,
+          );
+          item.plan = plan;
+          const dependentRecord = this.#plugins.get(item.old.pluginId);
+          item.prepared = await this.#prepareGeneration(item.definition, plan, {
+            shadowed: item.old,
+            rebindOverlay: overlay,
+            // Dependents keep their own definitions and configurations; only
+            // the replaced plugin's config changes.
+            effectiveConfig: dependentRecord?.effectiveConfig ?? EMPTY_CONFIG,
+            setupMs: timeouts.setupMs,
+          });
+          prepared.push(item.prepared);
+          this.#stageRebindBindings(item.prepared, overlay);
+        }
+
+        // Synchronous state commit: validate, withdraw every old generation,
+        // publish every candidate, swap records. No awaits: nothing can
+        // interleave between validation and publication. No event is emitted
+        // yet — the health gate below runs first, so observers never see a
+        // replacement that gets rolled back.
+        committed = this.#commitRebindState(definition.id, items);
+      } catch (error) {
+        // Abort: dispose every prepared candidate in reverse preparation
+        // order (dependents before the providers they resolved) and leave
+        // every old generation exactly as it was — the olds were never
+        // withdrawn, so there is nothing to restore.
+        const disposalErrors: unknown[] = [];
+        for (const candidate of [...prepared].reverse()) {
+          const report = await candidate.scope.dispose();
+          disposalErrors.push(...report.errors);
+        }
+        if (error instanceof PreparationFailure) {
+          record.error = this.#replacementFailure(
+            error.failureCause,
+            definition.id,
+            error.generationId,
+            [...error.disposalErrors, ...disposalErrors],
+          );
+        } else {
+          record.error = this.#replacementFailure(error, definition.id, undefined, disposalErrors);
+        }
+        this.#emit({ type: 'failed', pluginId: definition.id, error: record.error });
+        throw record.error;
+      }
+
+      if (committed === undefined) {
+        // Unreachable: the try block either commits or throws, and the catch
+        // always rethrows. Guarded for the type checker.
         throw new MoltError({
           code: 'INVALID_STATE',
           message: 'rebind transaction is internally inconsistent',
@@ -1755,165 +1863,81 @@ class RuntimeImpl implements Runtime {
           details: { reason: 'transaction-corrupt' },
         });
       }
-      providerItem.prepared = await this.#prepareGeneration(
-        providerItem.definition,
-        providerItem.plan,
-        {
-          shadowed: providerItem.old,
-          rebindOverlay: overlay,
-          effectiveConfig: newEffectiveConfig,
-          setupMs: timeouts.setupMs,
-        },
-      );
-      prepared.push(providerItem.prepared);
-      this.#stageRebindBindings(providerItem.prepared, overlay);
 
-      // Every dependent's declared range must still be satisfied by the
-      // rebound providers. Optional requirements the candidate no longer
-      // satisfies bind nothing instead of failing the transaction.
-      const droppedByDependent = this.#checkDependentRanges(
-        oldsInOrder,
-        reboundIds,
-        providerItem.prepared.stagedProvides,
-        definition.id,
-      );
-
-      for (const item of items.slice(1)) {
-        const plan = this.#rebindPlan(
-          item.old,
-          item.definition,
-          droppedByDependent.get(item.old.id) ?? new Set<string>(),
-          reboundIds,
-          overlay,
+      // Post-commit readiness gate over every candidate in the closure. A
+      // failing gate rolls the whole transaction back: candidates are
+      // withdrawn and disposed, olds restored exactly as they were.
+      for (const entry of committed) {
+        const candidate = entry.prepared.generation;
+        const healthContext = this.#buildContext(
+          entry.definition,
+          candidate,
+          new StagedContributions(candidate.pluginId, candidate.id),
+          new Map(),
+          entry.plan,
         );
-        item.plan = plan;
-        const dependentRecord = this.#plugins.get(item.old.pluginId);
-        item.prepared = await this.#prepareGeneration(item.definition, plan, {
-          shadowed: item.old,
-          rebindOverlay: overlay,
-          // Dependents keep their own definitions and configurations; only
-          // the replaced plugin's config changes.
-          effectiveConfig: dependentRecord?.effectiveConfig ?? EMPTY_CONFIG,
-          setupMs: timeouts.setupMs,
-        });
-        prepared.push(item.prepared);
-        this.#stageRebindBindings(item.prepared, overlay);
+        const health = await this.#runHealthCheck(candidate, healthContext, timeouts.healthMs);
+        if (!health.ok) {
+          await this.#rollbackRebind(committed);
+          record.error = this.#replacementFailure(
+            new MoltError({
+              code: 'REPLACEMENT_FAILED',
+              message: `plugin ${candidate.pluginId} failed its health check${health.message !== undefined ? `: ${health.message}` : ''}`,
+              pluginId: candidate.pluginId,
+              generation: candidate.id,
+              details: { reason: 'unhealthy', healthMessage: health.message },
+            }),
+            definition.id,
+            candidate.id,
+          );
+          this.#emit({ type: 'failed', pluginId: definition.id, error: record.error });
+          throw record.error;
+        }
       }
 
-      // Synchronous state commit: validate, withdraw every old generation,
-      // publish every candidate, swap records. No awaits: nothing can
-      // interleave between validation and publication. No event is emitted
-      // yet — the health gate below runs first, so observers never see a
-      // replacement that gets rolled back.
-      committed = this.#commitRebindState(definition.id, items);
-    } catch (error) {
-      // Abort: dispose every prepared candidate in reverse preparation
-      // order (dependents before the providers they resolved) and leave
-      // every old generation exactly as it was — the olds were never
-      // withdrawn, so there is nothing to restore.
-      const disposalErrors: unknown[] = [];
-      for (const candidate of [...prepared].reverse()) {
-        const report = await candidate.scope.dispose();
-        disposalErrors.push(...report.errors);
-      }
-      if (error instanceof PreparationFailure) {
-        record.error = this.#replacementFailure(
-          error.failureCause,
-          definition.id,
-          error.generationId,
-          [...error.disposalErrors, ...disposalErrors],
-        );
+      // The replacement sticks: record the new effective config, push the
+      // replaced definition onto the rollback history (or pop on rollback),
+      // then emit, provider-first.
+      record.definition = frozen;
+      record.effectiveConfig = newEffectiveConfig;
+      if (isRollback) {
+        record.history.pop();
       } else {
-        record.error = this.#replacementFailure(error, definition.id, undefined, disposalErrors);
+        this.#pushHistory(record, old.definition);
       }
-      this.#emit({ type: 'failed', pluginId: definition.id, error: record.error });
-      throw record.error;
+      for (const entry of committed) {
+        this.#emit({
+          type: 'replaced',
+          pluginId: entry.old.pluginId,
+          generation: entry.prepared.generation.id,
+        });
+      }
+
+      // Only after a successful commit: retire the old scopes, dependents
+      // first (reverse provider-first order, mirroring cascade stop). Each
+      // old generation's `drain` hook runs before its disposers, bounded by
+      // the drain timeout — expiry aborts the drain and disposal proceeds
+      // regardless. A disposal failure here is inspectable on the retired
+      // plugin's record; the replacement already succeeded and is never
+      // rolled back.
+      for (const retired of [...oldsInOrder].reverse()) {
+        await this.#drainGeneration(retired, timeouts.drainMs);
+        const report = await this.#disposeBounded(
+          retired.scope,
+          retired.pluginId,
+          retired.id,
+          timeouts.disposeMs,
+        );
+        if (report.errors.length > 0) {
+          const retiredRecord = this.#plugins.get(retired.pluginId);
+          if (retiredRecord !== undefined) {
+            retiredRecord.error = this.#disposalFailure(retired, report);
+          }
+        }
+      }
     } finally {
       for (const owned of oldsInOrder) {
         this.#rebindOwners.delete(owned.pluginId);
-      }
-    }
-
-    if (committed === undefined) {
-      // Unreachable: the try block either commits or throws, and the catch
-      // always rethrows. Guarded for the type checker.
-      throw new MoltError({
-        code: 'INVALID_STATE',
-        message: 'rebind transaction is internally inconsistent',
-        pluginId: definition.id,
-        details: { reason: 'transaction-corrupt' },
-      });
-    }
-
-    // Post-commit readiness gate over every candidate in the closure. A
-    // failing gate rolls the whole transaction back: candidates are
-    // withdrawn and disposed, olds restored exactly as they were.
-    for (const entry of committed) {
-      const candidate = entry.prepared.generation;
-      const healthContext = this.#buildContext(
-        entry.definition,
-        candidate,
-        new StagedContributions(candidate.pluginId, candidate.id),
-        new Map(),
-        entry.plan,
-      );
-      const health = await this.#runHealthCheck(candidate, healthContext, timeouts.healthMs);
-      if (!health.ok) {
-        await this.#rollbackRebind(committed);
-        record.error = this.#replacementFailure(
-          new MoltError({
-            code: 'REPLACEMENT_FAILED',
-            message: `plugin ${candidate.pluginId} failed its health check${health.message !== undefined ? `: ${health.message}` : ''}`,
-            pluginId: candidate.pluginId,
-            generation: candidate.id,
-            details: { reason: 'unhealthy', healthMessage: health.message },
-          }),
-          definition.id,
-          candidate.id,
-        );
-        this.#emit({ type: 'failed', pluginId: definition.id, error: record.error });
-        throw record.error;
-      }
-    }
-
-    // The replacement sticks: record the new effective config, push the
-    // replaced definition onto the rollback history (or pop on rollback),
-    // then emit, provider-first.
-    record.definition = frozen;
-    record.effectiveConfig = newEffectiveConfig;
-    if (isRollback) {
-      record.history.pop();
-    } else {
-      this.#pushHistory(record, old.definition);
-    }
-    for (const entry of committed) {
-      this.#emit({
-        type: 'replaced',
-        pluginId: entry.old.pluginId,
-        generation: entry.prepared.generation.id,
-      });
-    }
-
-    // Only after a successful commit: retire the old scopes, dependents
-    // first (reverse provider-first order, mirroring cascade stop). Each
-    // old generation's `drain` hook runs before its disposers, bounded by
-    // the drain timeout — expiry aborts the drain and disposal proceeds
-    // regardless. A disposal failure here is inspectable on the retired
-    // plugin's record; the replacement already succeeded and is never
-    // rolled back.
-    for (const retired of [...oldsInOrder].reverse()) {
-      await this.#drainGeneration(retired, timeouts.drainMs);
-      const report = await this.#disposeBounded(
-        retired.scope,
-        retired.pluginId,
-        retired.id,
-        timeouts.disposeMs,
-      );
-      if (report.errors.length > 0) {
-        const retiredRecord = this.#plugins.get(retired.pluginId);
-        if (retiredRecord !== undefined) {
-          retiredRecord.error = this.#disposalFailure(retired, report);
-        }
       }
     }
   }

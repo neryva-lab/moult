@@ -987,4 +987,81 @@ describe('rebind transaction ownership conflicts', () => {
     });
     expect(seenZ.at(-1)).toEqual({ tag: 'z-new' });
   });
+
+  it('holds transaction ownership through the health gate: concurrent lifecycle ops are rejected, not interleaved', async () => {
+    // Regression: ownership was released before the post-commit health
+    // gate, so a stop/updateConfig/replace landing inside the awaited
+    // probes could corrupt the commit or the rollback. Ownership must span
+    // the whole transaction.
+    const runtime = createRuntime();
+    const enteredHealth = createDeferred<void>();
+    const gateHealth = createDeferred<void>();
+    let healthArmed = false;
+    const healthCheck = async (): Promise<{ ok: boolean }> => {
+      if (healthArmed) {
+        enteredHealth.resolve();
+        await gateHealth.promise;
+      }
+      return { ok: true };
+    };
+    runtime.install({
+      id: 'test.hp',
+      version: '1.0.0',
+      provides: [{ capability: capA('1.0.0') }],
+      setup: (ctx) => {
+        ctx.provide(capA('1.0.0'), { tag: 'a1' });
+      },
+      healthCheck,
+    });
+    await runtime.start('test.hp');
+    runtime.install({
+      id: 'test.hd',
+      version: '1.0.0',
+      requires: [{ capability: capA('1.0.0'), range: '^1.0.0' }],
+      setup: (ctx) => {
+        ctx.require(capA('1.0.0'));
+      },
+    });
+    await runtime.start('test.hd');
+
+    healthArmed = true;
+    const replacement = runtime.replace({
+      id: 'test.hp',
+      version: '2.0.0',
+      provides: [{ capability: capA('1.0.0') }],
+      setup: (ctx) => {
+        ctx.provide(capA('1.0.0'), { tag: 'a2' });
+      },
+      healthCheck,
+    });
+    await enteredHealth.promise;
+
+    // Every lifecycle operation on an owned plugin fails loudly inside the
+    // health gate instead of interleaving with the commit. (stop throws
+    // synchronously; replace returns a rejected promise.)
+    expect(() => runtime.stop('test.hd')).toThrowError(
+      expect.objectContaining({ code: 'INVALID_STATE' }),
+    );
+    expect(() => runtime.updateConfig('test.hd', { x: 1 })).toThrowError(
+      expect.objectContaining({ code: 'INVALID_STATE' }),
+    );
+    expect(() =>
+      runtime.replace({
+        id: 'test.hd',
+        version: '1.0.1',
+        requires: [{ capability: capA('1.0.0'), range: '^1.0.0' }],
+        setup: (ctx) => {
+          ctx.require(capA('1.0.0'));
+        },
+      }),
+    ).toThrowError(expect.objectContaining({ code: 'INVALID_STATE' }));
+
+    gateHealth.resolve();
+    await replacement;
+    expect(runtime.getStatus('test.hp')).toBe('active');
+    expect(runtime.getStatus('test.hd')).toBe('active');
+    // Ownership is released after the transaction: operations work again.
+    await runtime.stop('test.hd');
+    expect(runtime.getStatus('test.hd')).toBe('stopped');
+  });
 });
