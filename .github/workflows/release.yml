@@ -171,13 +171,31 @@ jobs:
           const headSubject = execFileSync('git', ['log', '-1', '--format=%s'], {
             encoding: 'utf8',
           }).trim();
-          const changedFiles = execFileSync('git', ['diff-tree', '--no-commit-id', '--name-only', '-r', 'HEAD'], {
+          const parentCount = execFileSync('git', ['log', '-1', '--format=%P'], {
+            encoding: 'utf8',
+          })
+            .trim()
+            .split(/\s+/)
+            .filter(Boolean).length;
+          // Merge commits (e.g. merging changeset-release/main) carry the PR
+          // title as subject and `git diff-tree -r HEAD` lists no files, so a
+          // strict HEAD check would skip publishing a merged version bump.
+          // Accept the version subject from the merged head (second parent)
+          // and diff against the first parent instead. Squash-merging version
+          // PRs remains preferred; this only tolerates the merge-commit form.
+          const versionSubject =
+            headSubject === 'chore: version packages' || parentCount < 2
+              ? headSubject
+              : execFileSync('git', ['log', '-1', '--format=%s', 'HEAD^2'], {
+                  encoding: 'utf8',
+                }).trim();
+          const changedFiles = execFileSync('git', ['diff', '--name-only', 'HEAD~1', 'HEAD'], {
             encoding: 'utf8',
           })
             .trim()
             .split('\n')
             .filter(Boolean);
-          const versionedCommit = headSubject === 'chore: version packages';
+          const versionedCommit = versionSubject === 'chore: version packages';
           const versionFilesChanged = changedFiles.some(
             (file) => file.endsWith('/package.json') || file.endsWith('/CHANGELOG.md'),
           );
@@ -195,7 +213,7 @@ jobs:
             !pending &&
             publishable.length === 5 &&
             publishable.every(({ version }) => version !== '0.0.0');
-          console.log(JSON.stringify({ headSubject, versionedCommit, versionFilesChanged, pending, publishable, ready }));
+          console.log(JSON.stringify({ headSubject, versionSubject, versionedCommit, versionFilesChanged, pending, publishable, ready }));
           fs.appendFileSync(process.env.GITHUB_OUTPUT, `ready=${ready}\n`);
           NODE
 
